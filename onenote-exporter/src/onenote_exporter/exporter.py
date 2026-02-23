@@ -10,6 +10,7 @@ import pathlib
 import re
 import uuid
 import time
+import imghdr
 
 from bs4 import BeautifulSoup
 from markdownify import markdownify as md
@@ -44,9 +45,9 @@ def onenote_html_to_markdown(
 
     collected_assets: list[dict[str, Any]] = []
 
-    for tag in soup.find_all(["img", "object"]):
+    for tag in soup.find_all(["img", "object", "a"]):
         url_attr = None
-        for attr in ["data-fullres-src", "data-src", "src", "data"]:
+        for attr in ["data-fullres-src", "data-src", "src", "data", "href"]:
             if tag.has_attr(attr):
                 url_attr = attr
                 break
@@ -57,8 +58,25 @@ def onenote_html_to_markdown(
         if not res_url or not res_url.startswith("http"):
             continue
 
+        ocr_text = None
+        for a in ["alt", "title", "aria-label"]:
+            if tag.has_attr(a) and str(tag.get(a)).strip():
+                raw_ocr = str(tag.get(a))
+                ocr_text = re.sub(r"\s+", " ", raw_ocr).strip()
+                break
+
+        for a in ["alt", "title", "aria-label"]:
+            if tag.has_attr(a):
+                del tag[a]
+
+        if ocr_text:
+            tag["data-ocr-text"] = ocr_text
+
         fallback_name = f"res-{uuid.uuid4().hex}"
-        local_name = filename_from_url(res_url, fallback_name)
+        if res_url.endswith("/$value"):
+            local_name = fallback_name
+        else:
+            local_name = filename_from_url(res_url, fallback_name)
         local_path = assets_dir / local_name
 
         try:
@@ -68,19 +86,84 @@ def onenote_html_to_markdown(
             time.sleep(0.3)
             r = graph_get(token, res_url, stream=True)
             cd = r.headers.get("Content-Disposition", "")
+            ctype = r.headers.get("Content-Type", "")
+            is_audio = ctype.startswith("audio/")
+            
             if "filename=" in cd:
                 fn = cd.split("filename=")[-1].strip('"; ')
                 if fn:
                     local_path = local_path.with_name(fn)
+            else:
+                if local_path.name == "$value" or res_url.endswith("/$value"):
+                    local_path = local_path.with_name(fallback_name)
+
+            ext = mimetypes.guess_extension(ctype.split(";")[0].strip()) if ctype else None
+            if ext:
+                if local_path.suffix.lower() != ext:
+                    local_path = local_path.with_suffix(ext)
+
+            iterator = r.iter_content(chunk_size=8192)
+            first = next(iterator, b"")
+
+            ctype_main = (ctype.split(";")[0].strip().lower() if ctype else "")
+            ext = mimetypes.guess_extension(ctype_main) if ctype_main else None
+
+            if not ext or ext == ".bin" or ctype_main == "application/octet-stream":
+                img_kind = imghdr.what(None, h=first)
+                if img_kind == "jpeg":
+                    ext = ".jpg"
+                elif img_kind:
+                    ext = "." + img_kind
+
+                if (not ext or ext == ".bin") and first.startswith(b"%PDF"):
+                    ext = ".pdf"
+                if (not ext or ext == ".bin") and first.startswith(b"RIFF") and first[8:12] == b"WAVE":
+                    ext = ".wav"
+                if (not ext or ext == ".bin") and (first.startswith(b"ID3") or first[:2] in (b"\xff\xfb", b"\xff\xf3", b"\xff\xf2")):
+                    ext = ".mp3"
+                if (not ext or ext == ".bin") and len(first) >= 12 and first[4:8] == b"ftyp":
+                    major = first[8:12]
+                    if major.startswith(b"3gp"):
+                        ext = ".3gp"
+                    else:
+                        ext = ".m4a"
+
+            if ext:
+                if local_path.suffix.lower() in ("", ".bin", ".dat"):
+                    local_path = local_path.with_suffix(ext)
+
             hasher = hashlib.sha256()
             size = 0
+
             with open(local_path, "wb") as f:
-                for chunk in r.iter_content(chunk_size=8192):
+                if first:
+                    f.write(first)
+                    hasher.update(first)
+                    size += len(first)
+                for chunk in iterator:
                     if chunk:
                         f.write(chunk)
                         hasher.update(chunk)
                         size += len(chunk)
+
             rel_path = local_path.relative_to(assets_dir.parent).as_posix()
+
+            is_audio = (ctype_main.startswith("audio/") or ctype_main.endswith("3gpp") or ext == ".3gp" or ext in {".m4a", ".mp3", ".wav"})
+
+            if is_audio:
+                if tag.name == "a":
+                    tag["href"] = rel_path
+                    label = tag.get_text(" ", strip=True) or "Audio recording"
+                    tag.string = f"{label} ({rel_path})"
+                else:
+                    audio_tag = soup.new_tag("p")
+                    audio_tag.append("[AUDIO RECORDING] ")
+                    link = soup.new_tag("a", href=rel_path)
+                    link.string = "Play"
+                    audio_tag.append(link)
+                    tag.replace_with(audio_tag)
+                    continue
+
             if tag.name == "img":
                 tag["src"] = rel_path
                 for a in ["data-fullres-src", "data-src"]:
@@ -88,6 +171,13 @@ def onenote_html_to_markdown(
                         del tag.attrs[a]
             elif tag.name == "object":
                 tag["data"] = rel_path
+
+            ocr_text = tag.attrs.pop("data-ocr-text", None)
+            if ocr_text:
+                caption = soup.new_tag("p")
+                caption.string = f"[IMAGE OCR] {ocr_text}"
+                tag.insert_after(caption)
+
             collected_assets.append(
                 {
                     "rel_path": rel_path,
