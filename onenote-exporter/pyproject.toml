@@ -1,0 +1,40 @@
+[build-system]
+requires = ["setuptools", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "onenote-exporter"
+version = "0.1.0"
+description = "Export Microsoft OneNote notebooks to Markdown/DOCX and JSONL"
+authors = [{ name = "Your Name" }]
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+  "msal==1.31.0",
+  "requests==2.32.3",
+  "beautifulsoup4==4.12.3",
+  "markdownify==0.13.1",
+  "python-docx==1.1.2",
+  "tqdm==4.66.4",
+  "python-dateutil==2.9.0.post0",
+  "pypandoc==1.13",
+]
+
+[project.scripts]
+onenote-exporter = "onenote_exporter.cli:main"
+
+[tool.ruff]
+line-length = 88
+extend-select = ["I", "UP", "YTT", "T20", "B", "BLE", "C4", "RUF", "W"]
+ignore = ["E501"]
+
+[tool.ruff.lint.per-file-ignores]
+"src/onenote_exporter/cli.py" = ["T201"]
+"src/onenote_exporter/exporter.py" = ["T201"]
+"src/onenote_exporter/auth.py" = ["T201"]
+
+[tool.ruff.format]
+quote-style = "double"
+indent-style = "space"
+line-ending = "lf"
+skip-magic-trailing-comma = false

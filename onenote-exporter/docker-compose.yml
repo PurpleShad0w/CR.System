@@ -1,0 +1,21 @@
+services:
+  onenote-exporter:
+    build: .
+    environment:
+      # Azure app credentials (required)
+      - TENANT_ID=${TENANT_ID:-}
+      - CLIENT_ID=${CLIENT_ID:-}
+      - ADDITIONAL_SCOPES=${ADDITIONAL_SCOPES:-}
+
+      # Application settings
+      - OUTPUT_DIR=/app/output
+      - TOKEN_CACHE_PATH=/app/.cache/token_cache.bin
+      - PYTHONPATH=/app/src
+    volumes:
+      # Persistent output and cache directories
+      - ./output:/app/output
+      - ./cache:/app/.cache
+    command: ["--help"]
+
+    # Auto-create output and cache directories if they don't exist
+    init: true
