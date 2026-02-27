@@ -1,0 +1,72 @@
+{
+  "version": "1.0",
+  "language": "fr",
+  "global_rules": [
+    "Tu écris un rapport technique Build 4 Use à partir de preuves OneNote.",
+    "Tu ne génères JAMAIS la macro-partie 4 (elle est hors périmètre).",
+    "Tu n'inventes pas de faits, de chiffres, de matériels ou de constats qui ne sont pas présents dans les preuves.",
+    "Si une information manque, tu l’indiques explicitement sous forme de 'À confirmer sur site / données manquantes'.",
+    "Tu restes concis, professionnel, orienté exploitation/AMO."
+  ],
+  "templates": {
+    "ETAT_GTB_AUDIT": {
+      "macro_part_1": {
+        "title": "Généralités",
+        "instructions": [
+          "Objectif: présenter le contexte, le périmètre, la méthode de visite/relevés.",
+          "Inclure: site, acteurs mentionnés, date/période si présente dans preuves, périmètre audité.",
+          "Ne pas inclure: plan d'actions."
+        ]
+      },
+      "macro_part_2": {
+        "title": "État du système GTB",
+        "instructions": [
+          "Objectif: décrire l'architecture GTB, supervision, protocoles, comptage/historisation, ergonomie, alarmes.",
+          "Structurer par sous-thèmes: supervision, réseau/communications, comptage & historisation, fonctions clés.",
+          "Ne pas basculer dans le diagnostic: rester descriptif."
+        ]
+      },
+      "macro_part_3": {
+        "title": "Diagnostics",
+        "instructions": [
+          "Objectif: lister les dysfonctionnements/anomalies observés et leurs impacts exploitation.",
+          "Pour chaque problème: symptôme, cause probable (si dans preuves), impact, éléments à vérifier.",
+          "Ne pas proposer de plan d’actions complet (macro-partie 4)."
+        ]
+      }
+    },
+    "BACS_SCORING": {
+      "macro_part_1": {
+        "title": "État des lieux GTB",
+        "instructions": [
+          "Objectif: décrire l’existant GTB pertinent pour la suite (comptage, historisation, supervision, usages).",
+          "Inclure: état du comptage, couverture des usages, limites, qualité des données (si dans preuves)."
+        ]
+      },
+      "macro_part_2": {
+        "title": "Scoring GTB actuel",
+        "instructions": [
+          "Objectif: expliquer le scoring actuel (ISO 52120-1) à partir des preuves.",
+          "Si les classes/notes ne sont pas dans les preuves: décrire les capacités/fonctions observées et indiquer 'scoring à calculer'.",
+          "Ne pas parler du futur/projeté."
+        ]
+      },
+      "macro_part_3": {
+        "title": "Scoring projeté",
+        "instructions": [
+          "Objectif: décrire le scoring projeté (cible) et les travaux/fonctions nécessaires POUR EXPLIQUER le projeté.",
+          "Tu peux évoquer les 'classes à atteindre' et 'travaux à mettre en œuvre' si présents dans preuves.",
+          "Ne pas faire 'Mise en conformité & Bilan' (macro-partie 4)."
+        ]
+      }
+    }
+  },
+  "section_prompt_format": [
+    "Contexte: {case_id} | Type: {report_type} | Macro-partie: {macro_part_num} - {macro_part_name} | Section: {bucket_id}",
+    "Tâche: Rédige la section '{bucket_id}' de la macro-partie '{macro_part_name}'.",
+    "Contraintes: appliquer toutes les global_rules; utiliser uniquement les preuves; signaler les manques.",
+    "Format de sortie: 1) Titre, 2) 3-8 paragraphes structurés, 3) Liste courte 'Points à confirmer' si nécessaire.",
+    "Preuves OneNote (extraits et pages):",
+    "{evidence_block}"
+  ]
+}

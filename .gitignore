@@ -1,7 +1,10 @@
-Autocontrôles/
+.849C9593-D756-4E56-8D6E-42412F2A707B
+.env
+Autocontroles/
 Rapports d'audit/
+__pycache__/
+drafts/
+plans/
 processed/
 processed_reports/
 skeletons/
-
-.849C9593-D756-4E56-8D6E-42412F2A707B

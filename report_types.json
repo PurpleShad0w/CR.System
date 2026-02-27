@@ -1,0 +1,103 @@
+{
+  "version": "1.0",
+  "defaults": {
+    "generate_macro_parts": [1, 2, 3],
+    "language": "fr",
+    "selection": {
+      "min_section_score": 2.0,
+      "max_sections_per_macro_part": 8,
+      "max_pages_per_section": 5
+    }
+  },
+  "report_types": {
+    "ETAT_GTB_AUDIT": {
+      "label": "Audit État GTB (Généralités / État système / Diagnostics / Plan d'actions)",
+      "macro_parts": {
+        "1": { "name": "Généralités", "generate": true },
+        "2": { "name": "État du système GTB", "generate": true },
+        "3": { "name": "Diagnostics", "generate": true },
+        "4": { "name": "Plan d'actions", "generate": false }
+      },
+      "type_detection": {
+        "positive_keywords": [
+          "généralités",
+          "etat du système gtb",
+          "état du système gtb",
+          "plan d’actions",
+          "plan d'actions",
+          "diagnostic",
+          "dysfonction"
+        ],
+        "negative_keywords": [
+          "scoring projeté",
+          "futur : scoring",
+          "classe à atteindre",
+          "a atteindre au cctp"
+        ]
+      },
+      "section_buckets": {
+        "SITE_CONTEXTE": {
+          "macro_part": 1,
+          "keywords": ["contexte", "objectif", "périmètre", "visite de site", "présentation"]
+        },
+        "ARCHI_GTB": {
+          "macro_part": 2,
+          "keywords": ["architecture", "supervision", "serveur", "poste", "pcvue", "metasys", "iconics", "ebo", "zoning"]
+        },
+        "COMMUNICATIONS": {
+          "macro_part": 2,
+          "keywords": ["réseau", "ip", "bacnet", "modbus", "lon", "router", "switch", "ping", "hors communication"]
+        },
+        "DIAGNOSTICS": {
+          "macro_part": 3,
+          "keywords": ["diagnostic", "dysfonction", "anomalie", "essais", "défaut", "alarme", "valeurs incohérentes"]
+        }
+      }
+    },
+
+    "BACS_SCORING": {
+      "label": "Audit BACS / Scoring (État des lieux / Scoring actuel / Scoring projeté / Mise en conformité & Bilan)",
+      "macro_parts": {
+        "1": { "name": "État des lieux GTB", "generate": true },
+        "2": { "name": "Scoring GTB actuel", "generate": true },
+        "3": { "name": "Scoring projeté", "generate": true },
+        "4": { "name": "Mise en conformité & Bilan", "generate": false }
+      },
+      "type_detection": {
+        "positive_keywords": [
+          "actuel : scoring",
+          "scoring gtb actuel",
+          "scoring projeté",
+          "futur : scoring",
+          "classes à atteindre",
+          "a atteindre au cctp",
+          "iso 52120",
+          "décret bacs",
+          "mise en conformité"
+        ],
+        "negative_keywords": [
+          "plan d’actions correctives",
+          "plan d'actions correctives"
+        ]
+      },
+      "section_buckets": {
+        "ETAT_DES_LIEUX_GTB": {
+          "macro_part": 1,
+          "keywords": ["etat des lieux", "état des lieux", "vue gtb", "supervision", "comptage", "historisation", "alarmes"]
+        },
+        "SCORING_ACTUEL": {
+          "macro_part": 2,
+          "keywords": ["actuel", "scoring", "classe", "iso 52120", "52120-1"]
+        },
+        "SCORING_PROJETE": {
+          "macro_part": 3,
+          "keywords": ["futur", "projeté", "projeté", "travaux", "classes à atteindre", "cctp", "a atteindre"]
+        },
+        "CONFORMITE_BACS_BILAN": {
+          "macro_part": 4,
+          "keywords": ["mise en conformité", "décret bacs", "bilan", "compromis", "tri", "cee"]
+        }
+      }
+    }
+  }
+}
