@@ -32,6 +32,48 @@ import re
 from pathlib import Path
 from typing import Dict, Any, List, Tuple
 
+
+# --- BACX INTENT RULES ------------------------------------
+
+BACX_INTENT_BY_MACRO = {
+    "État des lieux GTB": "DESCRIBE_EXISTING",
+    "Scoring GTB actuel": "SCORE_EXISTING",
+    "Scoring projeté": "PROJECT_FUTURE",
+}
+
+INTENT_RULES = {
+    "DESCRIBE_EXISTING": {
+        "forbidden": [
+            "classe", "conforme", "non conforme",
+            "iso", "52120",
+            "objectif", "à atteindre",
+            "projeté", "futur", "travaux",
+        ],
+        "note": (
+            "Objectif : décrire strictement l’existant à partir des preuves OneNote. "
+            "Aucune interprétation normative ni projection."
+        ),
+    },
+    "SCORE_EXISTING": {
+        "forbidden": [
+            "travaux", "mise en œuvre",
+            "objectif", "futur", "projeté",
+        ],
+        "note": (
+            "Objectif : expliquer le scoring actuel selon l’ISO 52120‑1 "
+            "à partir des capacités observées."
+        ),
+    },
+    "PROJECT_FUTURE": {
+        "forbidden": [],
+        "note": (
+            "Objectif : décrire une cible normative (classe B a minima). "
+            "L’inférence est autorisée."
+        ),
+    },
+}
+
+
 def norm(s: str) -> str:
     s = (s or "").lower()
     s = re.sub(r"\s+", " ", s).strip()
@@ -203,6 +245,27 @@ def main():
             top_pages = r.get("top_pages") or []
 
             evidence = build_evidence_block(case_id, bucket_id, keywords, top_pages, pages_by_id)
+
+            intent = BACX_INTENT_BY_MACRO.get(mp_name)
+
+            rules = INTENT_RULES.get(intent, {})
+            intent_note = rules.get("note", "")
+            forbidden = rules.get("forbidden", [])
+
+            intent_header = ""
+            if intent:
+                intent_header = (
+                    f"### BACX_INTENT: {intent}\n"
+                    f"- {intent_note}\n"
+                )
+            if forbidden:
+                intent_header += (
+                    "- Termes interdits dans cette section : "
+                    + ", ".join(forbidden)
+                    + "\n\n"
+                )
+
+
             prompt = render_prompt(
                 tpl,
                 case_id=case_id,
