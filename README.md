@@ -87,6 +87,10 @@ run_llm_jobs.py
    ↓
 (enforcement / auto‑regen if enabled)
    ↓
+quality_score.py (deterministic gating on evidence + semantic rules)
+   ↓
+(optional auto‑regen policy - future)
+   ↓
 render_report_pptx.py
 ```
 

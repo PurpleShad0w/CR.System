@@ -7,6 +7,7 @@ from pathlib import Path
 from typing import Dict, Any, List
 
 from llm_client import make_client
+from quality_score import evaluate_quality
 
 def load_json(p: Path) -> Dict[str, Any]:
     return json.loads(p.read_text(encoding="utf-8"))
@@ -28,6 +29,8 @@ def main():
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--max_tokens", type=int, default=1200)
     ap.add_argument("--top_p", type=float, default=1.0)
+    ap.add_argument("--min_quality", type=float, default=0.0, help="If >0, fail when quality < min_quality")
+    ap.add_argument("--quality", default="", help="Path to write quality_report.json (default: out_dir/quality_report.json)")
     args = ap.parse_args()
 
     bundle_path = Path(args.bundle)
@@ -86,6 +89,16 @@ def main():
 
     print(f"Wrote: {gen_path}")
     print(f"Wrote: {assembled_path}")
+
+    # Deterministic quality scoring (enforcement outside the LLM)
+    quality = evaluate_quality(generated, assembled)
+    q_path = Path(args.quality) if args.quality else (out_dir / "quality_report.json")
+    save_json(q_path, quality)
+    print(f"Wrote: {q_path}")
+    print(f"Quality total: {quality.get('total')} / 100")
+
+    if args.min_quality and (quality.get("total", 0) < args.min_quality):
+        raise SystemExit(2)
 
 if __name__ == "__main__":
     main()
