@@ -1,252 +1,133 @@
+# 📘 GTB / BACS Report Generation System
 
-# Build4Use GTB / BACS Report Generation Pipeline
+> **But du README**
+> Ce README est le point d’entrée du projet (à coller au début d’une future conversation) : architecture, flux de données, règles non négociables, et état d’implémentation.
 
-This repository implements a **section-centric, evidence-driven pipeline** for generating GTB / BACS audit reports (PPTX) from OneNote field data.
-
-The pipeline has evolved from a page-based approach to a **OneNote section–level synthesis model**, which aligns with how real audit reports are produced by humans.
+## 1) Résumé (1 phrase)
+Ce projet génère des **rapports d’audit PowerPoint (PPTX)** à partir de **données terrain OneNote**, via un pipeline type « compilateur » (ingestion → synthèse section → planification → rédaction LLM → assemblage → rendu PPTX).
 
 ---
 
-## Core Design Principles
+## 2) Règles non négociables (hard constraints)
+- **`archive/` n’est jamais utilisé** : aucune logique ne doit dépendre de fichiers archivés.
+- **Extraction OneNote externe** : l’export OneNote est réalisé par un outil Docker (onenote-exporter). Le code Python consomme uniquement ses sorties.
+- **Macro‑partie 4** : elle existe dans la configuration, mais elle est **intentionnellement jamais générée** (tous types de rapports).
+- **Pages OneNote ≠ slides** : une page ne doit pas être résumée isolément comme une slide. Le rapport est synthétisé au niveau **section OneNote**.
+- **Renderer PPTX = pagination** : il découpe/pagine du texte, il **n’interprète pas** le sens.
 
-### 1. The Report Unit Is a OneNote Section
+---
 
-A **single report corresponds to one OneNote section**, for example:
+## 3) Concepts clés
+### 3.1 Unité de rapport = une section OneNote
+Un rapport correspond à **une section OneNote**, pas à une page. Le `case_id` est le **slug** du nom de section.
 
-- `Oseraie – OSNY`
-- `Clinique – Goussonville`
+### 3.2 Trois couches de données
+1) **Notes terrain** (pages OneNote brutes : titres, paragraphes, images, OCR, audio)
+2) **Synthèse de section** (inventaires, familles d’équipements, index des pages)
+3) **Texte du rapport** (macro-parties, sections, diagnostics)
 
-A OneNote *page* (e.g. “CTA 3 salle à manger”) is **never** treated as a report or slide on its own. Pages are field observations that must be **aggregated and synthesized**.
+---
 
-The canonical identifier (`case_id`) for a report is the **slug of the OneNote section name**:
+## 4) Types de rapports (config)
+Les types de rapports et leurs buckets sont définis dans `input/config/report_types.json`.
+
+### 4.1 ✅ Implémenté : `BACS_SCORING`
+Audit GTB sous **Décret BACS / ISO 52120‑1**, avec scoring actuel et projection.
+
+Macro‑parties :
+1. **État des lieux GTB** — générée
+2. **Scoring GTB actuel** — générée
+3. **Scoring projeté** — générée
+4. **Mise en conformité & Bilan** — définie mais **jamais générée**
+
+Buckets :
+- `ETAT_DES_LIEUX_GTB` → macro‑partie 1
+- `SCORING_ACTUEL` → macro‑partie 2
+- `SCORING_PROJETE` → macro‑partie 3
+- `CONFORMITE_BACS_BILAN` → macro‑partie 4 (non générée)
+
+### 4.2 🚧 Défini mais pas end‑to‑end : `ETAT_GTB_AUDIT`
+Audit technique (généralités, architecture, diagnostics). Planification/détection possible, mais le flux complet (enforcement / rendu dédié) n’est pas finalisé.
+
+---
+
+## 5) Pipeline de génération (end‑to‑end)
+Entrypoint : `run_pipeline.py`.
 
 ```text
-"Oseraie – OSNY" → oseraie_osny
-```
-
-All pipeline artifacts (plans, drafts, outputs) are keyed by this slug.
-
----
-
-### 2. Pages → Section Synthesis → Report Text
-
-The pipeline explicitly separates three conceptual layers:
-
-1. **Field notes** (raw OneNote pages: photos, short captions, headings)
-2. **Section-level synthesis** (inventory, clustering, recurring observations)
-3. **Narrative report text** (paragraphs, inventories, diagnostics)
-
-This avoids the common failure mode of asking an LLM to write a report directly from sparse page snippets.
-
----
-
-## Pipeline Stages
-
-### 0. OneNote Processing
-
-**Script**: `process_onenote.py`
-
-- Converts OneNote exports into structured JSON page packs
-- Preserves:
-  - section name
-  - page title
-  - blocks (`heading`, `paragraph`, `image`, `image_ocr`, `audio`)
-  - asset references (images)
-
-Output:
-```
-process/onenote/<notebook>/pages/*.json
+OneNote export (Docker)
+  ↓
+process_onenote.py
+  ↓
+aggregate_onenote_section.py      (synthèse section)
+  ↓
+plan_generation.py                (détection type + routing)
+  ↓
+generate_draft.py                 (jobs LLM par bucket)
+  ↓
+run_llm_jobs.py                   (LLM + assemblage + qualité)
+  ↓
+render_report_pptx.py             (pagination only)
+  ↓
+output/reports/<case_id>/Rapport_Audit.pptx
 ```
 
 ---
 
-### 1. Section-Level Aggregation (NEW)
-
-**Script**: `aggregate_onenote_section.py`
-
-This step aggregates **all pages belonging to one OneNote section** into a structured synthesis artifact.
-
-What it produces:
-- Equipment clustering by family (CTA, groupes froids, automates, etc.)
-- Inventory counts per family
-- Page index with titles and asset counts
-- Explicit reminder that pages are not mapped 1:1 to slides
-
-Output:
-```
-process/onenote_aggregates/<notebook>/<section_slug>.json
-```
-
-This artifact is **template-agnostic** and reused by downstream steps.
+## 6) Scripts (référence rapide)
+- `process_onenote.py` : transforme l’export Markdown en JSON structurés (pages + assets).
+- `aggregate_onenote_section.py` : agrège toutes les pages d’une section en une synthèse réutilisable.
+- `plan_generation.py` : choisit type/macro‑parties/buckets et route les preuves.
+- `generate_draft.py` : produit `draft_bundle.json` (prompts bucket‑centrés).
+- `run_llm_jobs.py` : exécute le LLM (single ou multistep), assemble `assembled_report.json`, calcule `quality_report.json`.
+- `render_report_pptx.py` : rend le PPTX final à partir du template + `assembled_report.json`.
+- `llm_client.py` : client HuggingFace Router (LLaMA), via `HF_TOKEN` / `HF_MODEL`.
 
 ---
 
-### 2. Planning
+## 7) Extension : Tableau 6 ISO 52120‑1 → scoring → slides (Partie 2)
+### 7.1 Fichier de règles
+Placer le JSON ici :
+- `input/rules/bacs_table6_rules_structured_clean.json`
 
-**Script**: `plan_generation.py`
+### 7.2 Principe
+Pour `BACS_SCORING`, `run_llm_jobs.py` peut :
+1) inférer un niveau (0..n ou null) pour chaque `rule_id` à partir de la synthèse OneNote,
+2) calculer **déterministiquement** les classes A/B/C/D par groupe,
+3) optionnellement demander à LLaMA de **mettre en forme** la macro‑partie 2 en “slides” (Markdown `####` + puces) pour le rendu PPTX.
 
-Inputs:
-- OneNote pages **filtered to the selected section only**
-- Report type configuration
-- Learned skeleton catalogs (structure priors)
-
-Responsibilities:
-- Detect report type (e.g. `BACS_SCORING`)
-- Select macro-parts to generate (1–3 only)
-- Select relevant section buckets
-- Route relevant pages to each bucket
-
-The generated plan explicitly records the `onenote_section` it applies to.
-
-Output:
-```
-process/plans/<section_slug>.json
-```
+### 7.3 Flags
+- `--section_aggregate <path>`
+- `--bacs_rules input/rules/bacs_table6_rules_structured_clean.json`
+- `--bacs_building_scope "Résidentiel" | "Non résidentiel"`
+- `--bacs_part2_slides` (active la génération slide‑ready en macro‑partie 2)
 
 ---
 
-### 3. Draft Generation (Section-Aware Prompting)
-
-**Script**: `generate_draft.py`
-
-This step **changes the LLM prompting contract**.
-
-Instead of:
-> “Write from these page snippets”
-
-The model is instructed:
-> “Write the report section based on the synthesized view of the entire OneNote section.”
-
-What is injected into each prompt:
-- Section-level synthesis (inventory, families, page counts)
-- Explicit instruction to:
-  - reproduce inventories when evidence is list-like
-  - synthesize across pages (not page-by-page paraphrase)
-- Then, detailed per-page evidence excerpts
-
-Outputs:
-```
-process/drafts/<section_slug>/
-  ├─ draft_bundle.json
-  ├─ prompts.txt
-  └─ prompts/<bucket_id>.txt
-```
-
----
-
-### 4. LLM Execution (Multi-Step)
-
-**Script**: `run_llm_jobs.py`
-
-Default mode: `multistep`
-
-Per section bucket:
-1. **Facts extraction** (JSON)
-2. **Writing from structured facts**
-3. **Optional repair pass** (semantic / compliance fixes)
-
-The output preserves:
-- `facts_json`
-- `draft_text`
-- `final_text`
-
-Backward compatibility is maintained (`generated_text` always populated).
-
-Outputs:
-```
-process/drafts/<section_slug>/
-  ├─ generated_bundle.json
-  ├─ assembled_report.json
-  └─ quality_report.json
-```
-
----
-
-### 5. Rendering (Pagination, Not Interpretation)
-
-**Script**: `render_report_pptx.py`
-
-Responsibilities:
-- Paginate text into slides
-- Split content by semantic headings (`####`)
-- Never reinterpret meaning or structure
-
-Important rule:
-> The renderer decides pagination, not content.
-
-Output:
-```
-output/reports/<section_slug>/Rapport_Audit.pptx
-```
-
----
-
-## End-to-End Example
-
-### Example: OneNote Section “Oseraie – OSNY”
-
-**Input (OneNote)**:
-- Section: `Oseraie – OSNY`
-- Pages:
-  - `CTA 3 – Salle à manger`
-  - `CTA 4`
-  - `Groupe froid – Terrasse`
-  - `Extracteurs`
-  - `Local automates`
-
-These pages contain mostly photos, short captions, and repeated equipment observations.
-
-**Aggregation Output**:
-```
-process/onenote_aggregates/test/oseraie_osny.json
-```
-Contains:
-- Inventory: 3 CTA, 1 groupe froid, multiple extracteurs
-- Recurrent issues: missing identification, local screens not powered
-
-**Plan**:
-```
-process/plans/oseraie_osny.json
-```
-Defines which buckets (e.g. État des lieux GTB, Architecture GTB) will be generated.
-
-**Drafts & LLM Output**:
-```
-process/drafts/oseraie_osny/
-  ├─ draft_bundle.json
-  ├─ generated_bundle.json
-  ├─ assembled_report.json
-  └─ quality_report.json
-```
-
-**Final Report**:
-```
-output/reports/oseraie_osny/Rapport_Audit.pptx
-```
-
-The resulting slides contain:
-- Paragraphs synthesizing observations across multiple pages
-- Explicit equipment inventories
-- No page-by-page narration
-
----
-
-## Running the Pipeline
-
+## 8) Exécution
+### 8.1 Pipeline complet
 ```bash
-python run_pipeline.py   --notebook test   --onenote-section "Oseraie - OSNY"
+python run_pipeline.py --notebook <NB> --onenote-section "<SECTION>"
+```
+
+### 8.2 Pipeline complet avec slides scoring (Partie 2)
+```bash
+python run_pipeline.py --notebook <NB> --onenote-section "<SECTION>" --bacs-part2-slides
 ```
 
 ---
 
-## Key Rules (Non-Negotiable)
-
-- ❌ OneNote pages are **not** slides
-- ❌ Pages are **not** summarized independently
-- ✅ All report text is synthesized at **section level**
-- ✅ Inventories must be preserved and reproduced
-- ✅ Templates control layout, not content logic
+## 9) Sous-composant : OneNote Exporter (Docker)
+Le projet utilise un exporter Docker pour extraire OneNote via Microsoft Graph API.
+La documentation complète de ce sous-composant est conservée dans :
+- `input/onenote-exporter/README.md`
 
 ---
 
-*This README documents the current canonical behavior of the pipeline. Any future template evolution must respect the section-level synthesis contract described above.*
+## 10) Aide‑mémoire (fast reload)
+- Unité = **section OneNote**
+- Pages ≠ slides
+- Macro‑partie 4 jamais générée
+- Renderer = pagination only
+- `BACS_SCORING` implémenté
+- Tableau 6 (JSON) possible pour scoring + slides Partie 2

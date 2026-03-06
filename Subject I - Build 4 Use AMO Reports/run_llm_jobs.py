@@ -7,9 +7,10 @@ import time
 import re
 from pathlib import Path
 from typing import Dict, Any, List, Optional, Tuple
+
 from llm_client import make_client
-from quality_score import evaluate_quality # deterministic full-report scorer
-import quality_score as qs # reuse exact rule lists + helpers to avoid divergence
+from quality_score import evaluate_quality  # deterministic full-report scorer
+import quality_score as qs  # reuse exact rule lists + helpers to avoid divergence
 from section_context import require_section_context
 
 # -----------------------------
@@ -73,7 +74,7 @@ def safe_chat(
             )
             if attempt >= retries or not transient:
                 break
-            sleep_s = base_sleep * (2**attempt) + random.uniform(0, 0.4)
+            sleep_s = base_sleep * (2 ** attempt) + random.uniform(0, 0.4)
             time.sleep(sleep_s)
     return None, last_err
 
@@ -87,6 +88,7 @@ def prompt_extract_facts(section: Dict[str, Any]) -> str:
     mp_name = section.get("macro_part_name") or f"Macro {mp}"
     bucket = section.get("bucket_id") or "SECTION"
     evidence = (section.get("evidence") or "").strip()
+
     schema = {
         "observations": ["string"],
         "entities": ["string"],
@@ -96,6 +98,7 @@ def prompt_extract_facts(section: Dict[str, Any]) -> str:
         "norm_refs": ["string"],
         "do_not_say": ["string"],
     }
+
     return (
         "Tu dois produire UNIQUEMENT un objet JSON valide (sans texte autour, sans markdown).\n"
         "Tâche: extraire un 'fact sheet' à partir des preuves OneNote.\n\n"
@@ -134,9 +137,10 @@ def prompt_repair(section: Dict[str, Any], facts: Dict[str, Any], draft_text: st
     bucket = section.get("bucket_id") or "SECTION"
     facts_json = json.dumps(facts, ensure_ascii=False, indent=2)
     issues_txt = "\n- ".join(issues) if issues else "(aucun)"
+
     return (
         "Tu dois CORRIGER une section de rapport pour supprimer des violations.\n"
-        f"Contexte: Macro-partie {mp} - {mp_name} | Bucket {bucket}\n\n"
+        f"Contexte: Macro-partie {mp} - {mp_name} Bucket {bucket}\n\n"
         "Contraintes:\n"
         "- Ne change pas le fond: reste fidèle aux FACTS.\n"
         "- Ne rajoute aucun fait.\n"
@@ -195,6 +199,7 @@ def heuristic_facts_from_evidence(section: Dict[str, Any]) -> Dict[str, Any]:
     evidence = (section.get("evidence") or "")
     lines = [ln.strip() for ln in evidence.splitlines() if ln.strip()]
     facts = default_empty_facts()
+
     for ln in lines:
         if ln.startswith("## Page:"):
             facts["entities"].append(ln.replace("## Page:", "").strip())
@@ -215,13 +220,12 @@ def heuristic_facts_from_evidence(section: Dict[str, Any]) -> Dict[str, Any]:
             continue
         if ln.startswith("- Bucket:") or ln.startswith("- Mots-clés:"):
             facts["constraints_from_evidence"].append(ln)
-            continue
 
     def dedup(seq):
         seen = set()
         out = []
         for x in seq:
-            k = x.strip()
+            k = (x or "").strip()
             if not k:
                 continue
             if k not in seen:
@@ -231,11 +235,12 @@ def heuristic_facts_from_evidence(section: Dict[str, Any]) -> Dict[str, Any]:
 
     for k in list(facts.keys()):
         facts[k] = dedup(facts[k])
+
     return facts
 
 
 # -----------------------------
-# Tableau 6 scoring (ISO 52120-1) — NEW
+# Tableau 6 scoring (ISO 52120-1)
 # -----------------------------
 
 def load_rules_json(path: str) -> Dict[str, Any]:
@@ -278,6 +283,7 @@ def compute_group_scores_from_table6(rules_doc: Dict[str, Any], building_scope: 
 
     order = {'D': 0, 'C': 1, 'B': 2, 'A': 3}
     out: Dict[str, Any] = {}
+
     for grp, items in by_group.items():
         rule_classes = []
         blockers = {'C': [], 'B': [], 'A': []}
@@ -292,80 +298,32 @@ def compute_group_scores_from_table6(rules_doc: Dict[str, Any], building_scope: 
                         'required_level': _req_level(r, building_scope, tgt),
                         'observed_level': lvl,
                     })
+
         achieved = min(rule_classes, key=lambda c: order.get(c, 0)) if rule_classes else 'D'
         out[grp] = {
             'achieved_class': achieved,
             'blockers': blockers,
             'rules_count': len(items),
         }
+
     return out
-
-
-def format_part2_scoring_markdown(group_scores: Dict[str, Any]) -> str:
-    lines: List[str] = []
-    lines.append('## Scoring GTB actuel selon ISO 52120-1')
-    lines.append('')
-    for grp, s in group_scores.items():
-        lines.append(f"#### {grp}")
-        lines.append(f"Classe atteinte (fonctionnalités BAC/GTB): **{s.get('achieved_class')}**")
-        b_block = (s.get('blockers') or {}).get('B') or []
-        if s.get('achieved_class') in ('C', 'D') and b_block:
-            lines.append('Principaux écarts bloquants vers la classe B:')
-            for b in b_block[:10]:
-                lines.append(f"- {b.get('rule_id')} — {b.get('title')} (niveau requis: {b.get('required_level')}, observé: {b.get('observed_level') if b.get('observed_level') is not None else 'non établi'})")
-        a_block = (s.get('blockers') or {}).get('A') or []
-        if a_block:
-            lines.append('Écarts vers la classe A (indicatif):')
-            for b in a_block[:6]:
-                lines.append(f"- {b.get('rule_id')} — {b.get('title')} (niveau requis: {b.get('required_level')}, observé: {b.get('observed_level') if b.get('observed_level') is not None else 'non établi'})")
-        lines.append('')
-    return '\n'.join(lines).strip() + '\n'
-
-
-def format_part3_travaux_markdown(rules_doc: Dict[str, Any], building_scope: str, observed_levels: Dict[str, Any], target_by_group: Optional[Dict[str, str]] = None) -> str:
-    target_by_group = target_by_group or {}
-    lines: List[str] = []
-    lines.append('## Futur : Scoring projeté et travaux à mettre en œuvre')
-    lines.append('')
-    groups = sorted({r.get('group') or 'Autres' for r in rules_doc.get('rules', [])})
-    for grp in groups:
-        tgt = target_by_group.get(grp, 'B')
-        missing = []
-        for r in rules_doc.get('rules', []):
-            if (r.get('group') or 'Autres') != grp:
-                continue
-            rid = r.get('rule_id')
-            lvl = observed_levels.get(rid)
-            lvl = int(lvl) if isinstance(lvl, (int, float)) else None
-            if not _meets(r, building_scope, tgt, lvl):
-                missing.append({
-                    'rule_id': rid,
-                    'title': r.get('title'),
-                    'required_level': _req_level(r, building_scope, tgt),
-                    'observed_level': lvl,
-                })
-        if not missing:
-            continue
-        lines.append(f"#### {grp} — Objectif classe {tgt}")
-        lines.append('Travaux / évolutions fonctionnelles à prévoir (au strict sens ISO 52120-1):')
-        for m in missing:
-            lines.append(f"- Mettre en œuvre {m['rule_id']} — {m['title']} (niveau requis: {m['required_level']}, observé: {m['observed_level'] if m['observed_level'] is not None else 'non établi'})")
-        lines.append('')
-    return '\n'.join(lines).strip() + '\n'
 
 
 def _digest_from_section_aggregate(agg: Dict[str, Any], max_pages: int = 22, max_blocks_per_page: int = 4) -> str:
     sec = agg.get('onenote_section') or (agg.get('section_context') or {}).get('onenote_section_name') or ''
     inv = agg.get('inventory') or []
     pages = agg.get('pages') or []
+
     lines: List[str] = []
     lines.append(f"Section OneNote: {sec}")
     lines.append(f"Pages agrégées: {agg.get('page_count')}")
     lines.append('')
+
     lines.append('Inventaire (familles):')
     for it in inv[:20]:
         lines.append(f"- {it.get('family')}: {it.get('count')} élément(s)")
     lines.append('')
+
     lines.append('Index des pages (titres + extraits):')
     for p in pages[:max_pages]:
         lines.append(f"- {p.get('title')} (images={p.get('num_images')}, audio={p.get('num_audio')})")
@@ -373,27 +331,31 @@ def _digest_from_section_aggregate(agg: Dict[str, Any], max_pages: int = 22, max
         for tb in tbs[:max_blocks_per_page]:
             txt = (tb.get('text') or '').strip()
             if txt:
-                lines.append(f"    * {tb.get('type')}: {txt[:220]}")
+                lines.append(f"  * {tb.get('type')}: {txt[:220]}")
+
     return '\n'.join(lines)
 
 
 def build_level_inference_prompt(agg: Dict[str, Any], rules_doc: Dict[str, Any], building_scope: str) -> str:
     digest = _digest_from_section_aggregate(agg)
+
     rlines: List[str] = []
     rlines.append(f"Bâtiment: {building_scope}")
     rlines.append('Règles Tableau 6 (IDs + niveaux):')
+
     for r in rules_doc.get('rules', []):
         lv = r.get('levels') or {}
         keys = [k for k in lv.keys() if str(k).isdigit()]
         keys = sorted(keys, key=lambda x: int(x))
         lv_desc = ', '.join([f"{k}:{lv[k].get('label')}" for k in keys])
         rlines.append(f"- {r.get('rule_id')} [{r.get('group')}] {r.get('title')} => {lv_desc}")
+
     rules_digest = '\n'.join(rlines)
 
     return (
         "Tu es un auditeur GTB/BACS. À partir des preuves OneNote ci-dessous, identifie le niveau implémenté (0,1,2,3,4...) pour CHAQUE règle Tableau 6.\n"
         "Sortie attendue: UNIQUEMENT un JSON valide (sans markdown) avec la forme:\n"
-        '{"levels": { "<rule_id>": <int|null>, ... },"evidence": { "<rule_id>": ["extrait preuve 1", ...] },"unknowns": ["points à confirmer"]}\n\n'
+        '{"levels": {"<rule_id>": <int|null>, ...}, "evidence": {"<rule_id>": ["extrait 1", ...]}, "unknowns": ["points à confirmer"]}\n\n'
         "Règles STRICTES:\n"
         "- Si tu ne peux pas établir un niveau, mets null.\n"
         "- Ne calcule PAS les classes A/B/C/D.\n"
@@ -405,15 +367,71 @@ def build_level_inference_prompt(agg: Dict[str, Any], rules_doc: Dict[str, Any],
 
 def infer_levels_with_llm(client, agg: Dict[str, Any], rules_doc: Dict[str, Any], building_scope: str, retries: int, retry_sleep: float) -> Dict[str, Any]:
     prompt = build_level_inference_prompt(agg, rules_doc, building_scope)
-    resp, err = safe_chat(client, build_messages(prompt), temperature=0.0, max_tokens=1600, top_p=1.0, retries=retries, base_sleep=retry_sleep)
+    resp, err = safe_chat(client, build_messages(prompt), temperature=0.0, max_tokens=1800, top_p=1.0, retries=retries, base_sleep=retry_sleep)
     if resp is None:
         return {"levels": {}, "evidence": {}, "unknowns": [f"LLM error: {err}"]}
+
     obj, perr = parse_json_safely(resp.text or '')
     if obj is None:
         return {"levels": {}, "evidence": {}, "unknowns": [f"Parse error: {perr}"]}
     if 'levels' not in obj:
         return {"levels": {}, "evidence": {}, "unknowns": ["No levels field in LLM output"]}
     return obj
+
+
+# -----------------------------
+# NEW: Part 2 slides prompt
+# -----------------------------
+
+def prompt_part2_scoring_slides(agg: Dict[str, Any], rules_doc: Dict[str, Any], building_scope: str, inferred: Dict[str, Any], group_scores: Dict[str, Any]) -> str:
+    """Ask LLaMA to format scoring into slide-ready markdown.
+
+    IMPORTANT: content source is the provided JSON; model only chooses layout / wording.
+    Renderer will split on '####' headings.
+    """
+    digest = _digest_from_section_aggregate(agg, max_pages=12, max_blocks_per_page=2)
+
+    payload = {
+        "building_scope": building_scope,
+        "inferred_levels": inferred.get('levels') or {},
+        "inferred_evidence": inferred.get('evidence') or {},
+        "unknowns": inferred.get('unknowns') or [],
+        "group_scores": group_scores,
+    }
+
+    # Provide a compact rules index to keep prompt smaller
+    rules_index = []
+    for r in rules_doc.get('rules', []):
+        rules_index.append({
+            "rule_id": r.get('rule_id'),
+            "group": r.get('group'),
+            "title": r.get('title'),
+            "class_requirements": (r.get('class_requirements') or {}).get(building_scope) or {},
+        })
+
+    return (
+        "Tu dois produire UNIQUEMENT du texte (pas de JSON), au format Markdown.\n"
+        "Objectif: générer des SLIDES de scoring (Partie 2) prêts à être paginés.\n\n"
+        "CONTRAINTES STRICTES:\n"
+        "- Tu n'inventes aucun fait.\n"
+        "- Tu n'utilises QUE les données JSON fournies ci-dessous (scores + preuves extraites).\n"
+        "- Si une information est inconnue, tu l'écris dans une slide 'Points à confirmer'.\n"
+        "- Format: chaque slide commence par une ligne '#### <Titre de slide>' puis des puces '- ...' (max 8 puces).\n"
+        "- Ne produis pas de macro-partie 4.\n\n"
+        "Contenu attendu (minimum):\n"
+        "1) Une slide 'Synthèse' (classes atteintes par usage/groupe)\n"
+        "2) Une slide par groupe (Chauffage / Refroidissement / Ventilation / ECS / Éclairage / Stores / GTB si présent)\n"
+        "   - rappeler la classe atteinte\n"
+        "   - lister 3-6 règles bloquantes vers B (si classe < B), avec (rule_id, niveau requis, niveau observé)\n"
+        "   - ajouter 1-2 extraits de preuves si disponibles dans inferred_evidence pour les règles bloquantes\n"
+        "3) Une slide 'Points à confirmer' (unknowns)\n\n"
+        "=== CONTEXTE ONE NOTE (digest) ===\n"
+        f"{digest}\n\n"
+        "=== RÈGLES (index, pour référence) ===\n"
+        f"{json.dumps(rules_index, ensure_ascii=False, indent=2)[:6000]}\n\n"
+        "=== DONNÉES DE SCORING (source unique) ===\n"
+        f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
+    )
 
 
 # -----------------------------
@@ -437,6 +455,7 @@ def detect_section_issues(section: Dict[str, Any], text: str) -> Tuple[List[str]
     ph_hits = qs.count_hits(t, qs.PLACEHOLDERS)
     mp1_presc_hits = qs.count_hits(t, qs.PRESCRIPTIVE_MP1) if mp == 1 else 0
     khr = keyword_hit_ratio(section, t)
+
     issues: List[str] = []
     if forb_hits:
         issues.append(f"forbidden_terms_hits={forb_hits}")
@@ -446,12 +465,14 @@ def detect_section_issues(section: Dict[str, Any], text: str) -> Tuple[List[str]
         issues.append(f"mp1_prescriptive_hits={mp1_presc_hits}")
     if (section.get("keywords") or []) and khr < 0.25:
         issues.append(f"low_keyword_alignment={khr:.2f}")
+
     metrics = {
         "forbidden_hits": forb_hits,
         "placeholder_hits": ph_hits,
         "mp1_prescriptive_hits": mp1_presc_hits,
         "keyword_hit_ratio": round(khr, 3),
     }
+
     return issues, metrics
 
 
@@ -463,17 +484,23 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--bundle", required=True, help="Path to process/drafts/<case_id>/draft_bundle.json")
     ap.add_argument("--out", default="", help="Output folder (defaults to bundle folder)")
+
     ap.add_argument("--temperature", type=float, default=0.2)
     ap.add_argument("--max_tokens", type=int, default=1200)
     ap.add_argument("--top_p", type=float, default=1.0)
+
     ap.add_argument("--mode", choices=["single", "multistep"], default="single", help="single = one call per section; multistep = facts->write (+repair)")
+
     ap.add_argument("--facts_max_tokens", type=int, default=500)
     ap.add_argument("--facts_temperature", type=float, default=0.0)
+
     ap.add_argument("--repair_max_tokens", type=int, default=900)
     ap.add_argument("--repair_temperature", type=float, default=0.2)
     ap.add_argument("--max_repairs", type=int, default=1)
+
     ap.add_argument("--min_quality", type=float, default=0.0)
     ap.add_argument("--quality", default="", help="Path to write quality_report.json")
+
     ap.add_argument("--retries", type=int, default=4)
     ap.add_argument("--retry_sleep", type=float, default=1.2)
 
@@ -483,6 +510,9 @@ def main():
     ap.add_argument("--bacs_building_scope", default="Non résidentiel", choices=["Résidentiel", "Non résidentiel"], help="Scope for Tableau 6")
     ap.add_argument("--bacs_targets", default="", help="Optional JSON file mapping group->target class for Part 3")
 
+    # NEW: slide generation for Part 2 using LLaMA
+    ap.add_argument("--bacs_part2_slides", action="store_true", help="If set, Part 2 is generated by LLaMA as slide-ready markdown.")
+
     args = ap.parse_args()
 
     bundle_path = Path(args.bundle)
@@ -490,13 +520,14 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     bundle = load_json(bundle_path)
-
     if bundle.get("section_context"):
         require_section_context(bundle, "draft_bundle.json")
 
     client = make_client()
+
     generated = dict(bundle)
 
+    # 1) Generate sections via LLM (existing behavior)
     for sec in generated.get("sections", []):
         base_prompt = (sec.get("prompt") or "").strip()
         if not base_prompt:
@@ -538,6 +569,7 @@ def main():
             retries=args.retries,
             base_sleep=args.retry_sleep,
         )
+
         if facts_resp is None:
             sec["facts_llm_error"] = facts_err
             facts_obj = heuristic_facts_from_evidence(sec)
@@ -552,8 +584,8 @@ def main():
                 sec["facts_source"] = "heuristic_parse_fallback"
             else:
                 sec["facts_source"] = "llm"
-            sec["facts_json"] = facts_obj
-            sec["llm_raw_facts"] = facts_resp.raw
+                sec["facts_json"] = facts_obj
+                sec["llm_raw_facts"] = facts_resp.raw
 
         write_prompt = prompt_write_from_facts(sec, facts_obj)
         write_resp, write_err = safe_chat(
@@ -565,6 +597,7 @@ def main():
             retries=args.retries,
             base_sleep=args.retry_sleep,
         )
+
         if write_resp is None:
             sec["write_llm_error"] = write_err
             sec["fallback_mode"] = "single_due_to_write_error"
@@ -598,6 +631,7 @@ def main():
             sec["section_metrics"] = metrics
             if not issues:
                 break
+
             rep_prompt = prompt_repair(sec, facts_obj, final_text, issues)
             rep_resp, rep_err = safe_chat(
                 client,
@@ -611,6 +645,7 @@ def main():
             if rep_resp is None:
                 sec.setdefault("repair_errors", []).append({"issues": issues, "error": rep_err})
                 break
+
             repaired = (rep_resp.text or "").strip()
             sec.setdefault("repair_attempts", []).append({
                 "issues": issues,
@@ -627,6 +662,7 @@ def main():
     gen_path = out_dir / "generated_bundle.json"
     save_json(gen_path, generated)
 
+    # 2) Assemble report
     assembled: Dict[str, Any] = {
         "case_id": generated.get("case_id"),
         "report_type": generated.get("report_type"),
@@ -649,17 +685,44 @@ def main():
             ],
         })
 
-    # -------------------------
-    # Tableau 6 scoring injection for Part 2 & Part 3 (NEW)
-    # -------------------------
-    if args.section_aggregate and args.bacs_rules:
+    # 3) Tableau 6 scoring injection for Part 2 & Part 3 (ISO 52120-1)
+    # Gated to BACS_SCORING to avoid overriding other report types.
+    if (generated.get('report_type') == 'BACS_SCORING') and args.section_aggregate and args.bacs_rules:
         try:
             rules_doc = load_rules_json(args.bacs_rules)
             agg = load_json(Path(args.section_aggregate))
+
             inferred = infer_levels_with_llm(client, agg, rules_doc, args.bacs_building_scope, args.retries, args.retry_sleep)
             observed_levels = inferred.get('levels') or {}
+
             group_scores = compute_group_scores_from_table6(rules_doc, args.bacs_building_scope, observed_levels)
 
+            # Part 2: either deterministic markdown or LLaMA slide markdown
+            if args.bacs_part2_slides:
+                p = prompt_part2_scoring_slides(agg, rules_doc, args.bacs_building_scope, inferred, group_scores)
+                resp, err = safe_chat(client, build_messages(p), temperature=0.2, max_tokens=1400, top_p=1.0, retries=args.retries, base_sleep=args.retry_sleep)
+                if resp is None:
+                    part2_text = "## Scoring GTB actuel selon ISO 52120-1\n\n- À confirmer sur site / données manquantes (erreur LLM slides)\n"
+                    assembled.setdefault('bacs_table6_errors', []).append(f"Part2 slides LLM error: {err}")
+                else:
+                    part2_text = (resp.text or '').strip() + "\n"
+            else:
+                # keep the existing deterministic formatter (compact)
+                lines = []
+                lines.append('## Scoring GTB actuel selon ISO 52120-1')
+                lines.append('')
+                for grp, s in group_scores.items():
+                    lines.append(f"#### {grp}")
+                    lines.append(f"Classe atteinte (fonctionnalités BAC/GTB): **{s.get('achieved_class')}**")
+                    b_block = (s.get('blockers') or {}).get('B') or []
+                    if s.get('achieved_class') in ('C', 'D') and b_block:
+                        lines.append('Principaux écarts bloquants vers la classe B:')
+                        for b in b_block[:10]:
+                            lines.append(f"- {b.get('rule_id')} — {b.get('title')} (niveau requis: {b.get('required_level')}, observé: {b.get('observed_level') if b.get('observed_level') is not None else 'non établi'})")
+                    lines.append('')
+                part2_text = '\n'.join(lines).strip() + '\n'
+
+            # Part 3: keep deterministic travaux list (target default B)
             target_by_group = {}
             if args.bacs_targets:
                 try:
@@ -667,8 +730,34 @@ def main():
                 except Exception:
                     target_by_group = {}
 
-            part2_text = format_part2_scoring_markdown(group_scores)
-            part3_text = format_part3_travaux_markdown(rules_doc, args.bacs_building_scope, observed_levels, target_by_group)
+            lines = []
+            lines.append('## Futur : Scoring projeté et travaux à mettre en œuvre')
+            lines.append('')
+            groups = sorted({r.get('group') or 'Autres' for r in rules_doc.get('rules', [])})
+            for grp in groups:
+                tgt = target_by_group.get(grp, 'B')
+                missing = []
+                for r in rules_doc.get('rules', []):
+                    if (r.get('group') or 'Autres') != grp:
+                        continue
+                    rid = r.get('rule_id')
+                    lvl = observed_levels.get(rid)
+                    lvl = int(lvl) if isinstance(lvl, (int, float)) else None
+                    if not _meets(r, args.bacs_building_scope, tgt, lvl):
+                        missing.append({
+                            'rule_id': rid,
+                            'title': r.get('title'),
+                            'required_level': _req_level(r, args.bacs_building_scope, tgt),
+                            'observed_level': lvl,
+                        })
+                if not missing:
+                    continue
+                lines.append(f"#### {grp} — Objectif classe {tgt}")
+                lines.append('Travaux / évolutions fonctionnelles à prévoir (au strict sens ISO 52120-1):')
+                for m in missing:
+                    lines.append(f"- Mettre en œuvre {m['rule_id']} — {m['title']} (niveau requis: {m['required_level']}, observé: {m['observed_level'] if m['observed_level'] is not None else 'non établi'})")
+                lines.append('')
+            part3_text = '\n'.join(lines).strip() + '\n'
 
             assembled['bacs_table6'] = {
                 'building_scope': args.bacs_building_scope,
@@ -690,6 +779,7 @@ def main():
 
             upsert_macro(2, 'Scoring GTB actuel selon ISO 52120-1', part2_text)
             upsert_macro(3, 'Futur : Scoring projeté et travaux à mettre en œuvre', part3_text)
+
         except Exception as e:
             assembled.setdefault('bacs_table6_errors', []).append(str(e))
 
@@ -702,6 +792,7 @@ def main():
     quality = evaluate_quality(generated, assembled)
     q_path = Path(args.quality) if args.quality else (out_dir / "quality_report.json")
     save_json(q_path, quality)
+
     print(f"Wrote: {q_path}")
     print(f"Quality total: {quality.get('total')} / 100")
 
