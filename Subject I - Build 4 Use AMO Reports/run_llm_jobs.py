@@ -13,6 +13,14 @@ from quality_score import evaluate_quality  # deterministic full-report scorer
 import quality_score as qs  # reuse exact rule lists + helpers to avoid divergence
 from section_context import require_section_context
 
+
+try:
+    from dotenv import load_dotenv
+    load_dotenv(override=False)  # charge .env si présent dans le cwd
+except Exception:
+    pass
+
+
 # -----------------------------
 # IO helpers
 # -----------------------------
