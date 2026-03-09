@@ -1,12 +1,14 @@
 {
-  "version": "1.0",
+  "version": "1.1",
   "language": "fr",
   "global_rules": [
     "Tu écris un rapport technique Build 4 Use à partir de preuves OneNote.",
     "Tu ne génères JAMAIS la macro-partie 4 (elle est hors périmètre).",
     "Tu n'inventes pas de faits, de chiffres, de matériels ou de constats qui ne sont pas présents dans les preuves.",
+    "Chaque constat important DOIT être rattaché à une preuve (au moins un extrait + un page_id).",
     "Si une information manque, tu l’indiques explicitement sous forme de 'À confirmer sur site / données manquantes'.",
-    "Tu restes concis, professionnel, orienté exploitation/AMO."
+    "Tu restes concis, professionnel, orienté exploitation/AMO.",
+    "Tu ne réponds jamais aux questions présentes dans les notes comme si c'était un fait observé : traite-les comme 'Points à confirmer'."
   ],
   "templates": {
     "ETAT_GTB_AUDIT": {
@@ -15,7 +17,8 @@
         "instructions": [
           "Objectif: présenter le contexte, le périmètre, la méthode de visite/relevés.",
           "Inclure: site, acteurs mentionnés, date/période si présente dans preuves, périmètre audité.",
-          "Ne pas inclure: plan d'actions."
+          "Ne pas inclure: plan d'actions.",
+          "Structure attendue: Contexte / Périmètre / Méthode / Points à confirmer."
         ]
       },
       "macro_part_2": {
@@ -23,7 +26,8 @@
         "instructions": [
           "Objectif: décrire l'architecture GTB, supervision, protocoles, comptage/historisation, ergonomie, alarmes.",
           "Structurer par sous-thèmes: supervision, réseau/communications, comptage & historisation, fonctions clés.",
-          "Ne pas basculer dans le diagnostic: rester descriptif."
+          "Ne pas basculer dans le diagnostic: rester descriptif.",
+          "Structure attendue: Supervision / Réseau & protocoles / Comptage & historisation / Alarmes / Limites / Points à confirmer."
         ]
       },
       "macro_part_3": {
@@ -31,7 +35,8 @@
         "instructions": [
           "Objectif: lister les dysfonctionnements/anomalies observés et leurs impacts exploitation.",
           "Pour chaque problème: symptôme, cause probable (si dans preuves), impact, éléments à vérifier.",
-          "Ne pas proposer de plan d’actions complet (macro-partie 4)."
+          "Ne pas proposer de plan d’actions complet (macro-partie 4).",
+          "Structure attendue: Liste de constats (symptôme/cause/impact) + Points à confirmer."
         ]
       }
     },
@@ -40,7 +45,9 @@
         "title": "État des lieux GTB",
         "instructions": [
           "Objectif: décrire l’existant GTB pertinent pour la suite (comptage, historisation, supervision, usages).",
-          "Inclure: état du comptage, couverture des usages, limites, qualité des données (si dans preuves)."
+          "Inclure: état du comptage, couverture des usages, limites, qualité des données (si dans preuves).",
+          "Interdit: recommandations, travaux, classes, conformité, ISO 52120-1.",
+          "Structure attendue: Comptage / Supervision / Historisation / Alarmes / Couverture des usages / Limites / Points à confirmer."
         ]
       },
       "macro_part_2": {
@@ -48,7 +55,8 @@
         "instructions": [
           "Objectif: expliquer le scoring actuel (ISO 52120-1) à partir des preuves.",
           "Si les classes/notes ne sont pas dans les preuves: décrire les capacités/fonctions observées et indiquer 'scoring à calculer'.",
-          "Ne pas parler du futur/projeté."
+          "Ne pas parler du futur/projeté.",
+          "Structure attendue: Capacités observées par usage/groupe + limites de preuve + Points à confirmer."
         ]
       },
       "macro_part_3": {
@@ -56,7 +64,8 @@
         "instructions": [
           "Objectif: décrire le scoring projeté (cible) et les travaux/fonctions nécessaires POUR EXPLIQUER le projeté.",
           "Tu peux évoquer les 'classes à atteindre' et 'travaux à mettre en œuvre' si présents dans preuves.",
-          "Ne pas faire 'Mise en conformité & Bilan' (macro-partie 4)."
+          "Ne pas faire 'Mise en conformité & Bilan' (macro-partie 4).",
+          "Structure attendue: Hypothèses / Cible / Travaux & fonctions / Points à confirmer."
         ]
       }
     }
@@ -64,8 +73,12 @@
   "section_prompt_format": [
     "Contexte: {case_id} | Type: {report_type} | Macro-partie: {macro_part_num} - {macro_part_name} | Section: {bucket_id}",
     "Tâche: Rédige la section '{bucket_id}' de la macro-partie '{macro_part_name}'.",
-    "Contraintes: appliquer toutes les global_rules; utiliser uniquement les preuves; signaler les manques.",
-    "Format de sortie: 1) Titre, 2) 3-8 paragraphes structurés, 3) Liste courte 'Points à confirmer' si nécessaire.",
+    "Contraintes: appliquer toutes les global_rules; utiliser uniquement les preuves; ne pas inventer; signaler les manques.",
+    "Format de sortie (obligatoire):",
+    "- Un titre (###).",
+    "- Des sous-titres (####) suivant le plan fourni.",
+    "- Sous chaque sous-titre: 3 à 8 puces 'Constat:' avec une ligne 'Preuve:' contenant au moins un page_id et un extrait court.",
+    "- Une section finale '#### Points à confirmer' si nécessaire.",
     "Preuves OneNote (extraits et pages):",
     "{evidence_block}"
   ]

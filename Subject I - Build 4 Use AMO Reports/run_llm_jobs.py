@@ -13,13 +13,11 @@ from quality_score import evaluate_quality  # deterministic full-report scorer
 import quality_score as qs  # reuse exact rule lists + helpers to avoid divergence
 from section_context import require_section_context
 
-
 try:
     from dotenv import load_dotenv
-    load_dotenv(override=False)  # charge .env si présent dans le cwd
+    load_dotenv(override=False)
 except Exception:
     pass
-
 
 # -----------------------------
 # IO helpers
@@ -116,7 +114,7 @@ def prompt_extract_facts(section: Dict[str, Any]) -> str:
         "- Ne propose PAS de travaux/actions (sauf si c'est explicitement énoncé comme fait/élément dans les preuves).\n"
         "- Ne déduis pas de faits non présents.\n"
         "- Si une information manque, mets-la dans unknowns.\n"
-        "- Si une phrase des preuves est une QUESTION/DEMANDE (ex: 'peux-tu...'), ne la transforme pas en fait.\n\n"
+        "- Si une phrase des preuves est une QUESTION/DEMANDE (ex: 'peux-tu...'), ne la transforme pas en fait (mets-la dans unknowns).\n\n"
         f"Format JSON attendu (mêmes clés):\n{json.dumps(schema, ensure_ascii=False)}\n\n"
         f"Preuves (texte brut):\n{evidence}\n"
     )
@@ -130,11 +128,12 @@ def prompt_write_from_facts(section: Dict[str, Any], facts: Dict[str, Any]) -> s
         "---\n"
         "FACTS (JSON) = source UNIQUE\n"
         "Tu dois utiliser UNIQUEMENT ces FACTS pour rédiger. Ignore les preuves brutes.\n"
+        "Pour chaque constat important, ajoute une ligne 'Preuve: page_id=... + extrait court'.\n"
         f"{facts_json}\n"
         "---\n\n"
         "Rappel critique:\n"
         "- N'invente rien.\n"
-        "- Si quelque chose est dans unknowns, indique-le explicitement dans 'Points à confirmer'.\n"
+        "- Si quelque chose est dans unknowns, indique-le explicitement dans '#### Points à confirmer'.\n"
         "- Respecte strictement l'intention de la macro-partie.\n"
     )
 
@@ -153,7 +152,9 @@ def prompt_repair(section: Dict[str, Any], facts: Dict[str, Any], draft_text: st
         "- Ne change pas le fond: reste fidèle aux FACTS.\n"
         "- Ne rajoute aucun fait.\n"
         "- Supprime toute formulation qui viole les règles listées.\n"
-        "- Si info manquante: mets-la dans 'Points à confirmer'.\n"
+        "- Si info manquante: mets-la dans '#### Points à confirmer'.\n"
+        "- Si les preuves contiennent des questions/demandes, ne les transforme pas en faits: mets-les dans '#### Points à confirmer'.\n"
+        "- Conserver le plan (####) et le format Constats/Preuve.\n"
         "- Sortie: UNIQUEMENT le texte corrigé.\n\n"
         f"Issues détectées:\n- {issues_txt}\n\n"
         f"FACTS (source unique):\n{facts_json}\n\n"
@@ -248,7 +249,96 @@ def heuristic_facts_from_evidence(section: Dict[str, Any]) -> Dict[str, Any]:
 
 
 # -----------------------------
-# Tableau 6 scoring (ISO 52120-1)
+# NEW: traceability + sanitization
+# -----------------------------
+
+def has_evidence_markers(text: str) -> bool:
+    t = (text or "")
+    return ("page_id=" in t) or ("Preuve:" in t) or ("[preuve" in t.lower())
+
+
+def sanitize_text_for_intent(section: Dict[str, Any], text: str) -> str:
+    """Deterministic last-resort sanitizer.
+
+    Removes lines that violate intent constraints.
+    Uses the same forbidden/prescriptive lists as quality_score.
+    """
+    mp = section.get("macro_part")
+    if not text:
+        return text
+
+    lines = text.splitlines()
+    out = []
+
+    forb = qs.INTENT_FORBIDDEN.get(mp, [])
+    presc = qs.PRESCRIPTIVE_MP1 if mp == 1 else []
+
+    for ln in lines:
+        lnorm = qs.norm(ln)
+        if lnorm.startswith("####") or lnorm.startswith("###"):
+            out.append(ln)
+            continue
+        if "points à confirmer" in lnorm:
+            out.append(ln)
+            continue
+        if any(qs.norm(f) in lnorm for f in forb if f):
+            continue
+        if mp == 1 and any(qs.norm(p) in lnorm for p in presc if p):
+            continue
+        if any(qs.norm(p) in lnorm for p in qs.PLACEHOLDERS if p):
+            continue
+        out.append(ln)
+
+    return "\n".join(out).strip()
+
+
+def keyword_hit_ratio(section: Dict[str, Any], text: str) -> float:
+    kws = [qs.norm(k) for k in (section.get("keywords") or []) if k]
+    t = qs.norm(text or "")
+    if not kws:
+        return 0.0
+    hits = sum(1 for k in kws if k and k in t)
+    return hits / len(kws)
+
+
+def detect_section_issues(section: Dict[str, Any], text: str, strict_traceability: bool = False) -> Tuple[List[str], Dict[str, Any]]:
+    mp = section.get("macro_part")
+    t = text or ""
+
+    forb = qs.INTENT_FORBIDDEN.get(mp, [])
+    forb_hits = qs.count_hits(t, forb)
+    ph_hits = qs.count_hits(t, qs.PLACEHOLDERS)
+    mp1_presc_hits = qs.count_hits(t, qs.PRESCRIPTIVE_MP1) if mp == 1 else 0
+    khr = keyword_hit_ratio(section, t)
+
+    issues: List[str] = []
+    if forb_hits:
+        issues.append(f"forbidden_terms_hits={forb_hits}")
+    if ph_hits:
+        issues.append(f"placeholders_hits={ph_hits}")
+    if mp1_presc_hits:
+        issues.append(f"mp1_prescriptive_hits={mp1_presc_hits}")
+    if (section.get("keywords") or []) and khr < 0.25:
+        issues.append(f"low_keyword_alignment={khr:.2f}")
+
+    if strict_traceability:
+        tp = section.get("top_pages") or []
+        if tp and not has_evidence_markers(t):
+            issues.append("missing_evidence_markers")
+
+    metrics = {
+        "forbidden_hits": forb_hits,
+        "placeholder_hits": ph_hits,
+        "mp1_prescriptive_hits": mp1_presc_hits,
+        "keyword_hit_ratio": round(khr, 3),
+        "has_evidence_markers": bool(has_evidence_markers(t)),
+    }
+
+    return issues, metrics
+
+
+# -----------------------------
+# Tableau 6 scoring (ISO 52120-1) — copied from your current pipeline
 # -----------------------------
 
 def load_rules_json(path: str) -> Dict[str, Any]:
@@ -295,6 +385,7 @@ def compute_group_scores_from_table6(rules_doc: Dict[str, Any], building_scope: 
     for grp, items in by_group.items():
         rule_classes = []
         blockers = {'C': [], 'B': [], 'A': []}
+
         for r, lvl in items:
             rc = _highest_class_for_rule(r, building_scope, lvl)
             rule_classes.append(rc)
@@ -330,9 +421,10 @@ def _digest_from_section_aggregate(agg: Dict[str, Any], max_pages: int = 22, max
     lines.append('Inventaire (familles):')
     for it in inv[:20]:
         lines.append(f"- {it.get('family')}: {it.get('count')} élément(s)")
-    lines.append('')
 
+    lines.append('')
     lines.append('Index des pages (titres + extraits):')
+
     for p in pages[:max_pages]:
         lines.append(f"- {p.get('title')} (images={p.get('num_images')}, audio={p.get('num_audio')})")
         tbs = p.get('text_blocks') or []
@@ -346,7 +438,6 @@ def _digest_from_section_aggregate(agg: Dict[str, Any], max_pages: int = 22, max
 
 def build_level_inference_prompt(agg: Dict[str, Any], rules_doc: Dict[str, Any], building_scope: str) -> str:
     digest = _digest_from_section_aggregate(agg)
-
     rlines: List[str] = []
     rlines.append(f"Bâtiment: {building_scope}")
     rlines.append('Règles Tableau 6 (IDs + niveaux):')
@@ -363,7 +454,7 @@ def build_level_inference_prompt(agg: Dict[str, Any], rules_doc: Dict[str, Any],
     return (
         "Tu es un auditeur GTB/BACS. À partir des preuves OneNote ci-dessous, identifie le niveau implémenté (0,1,2,3,4...) pour CHAQUE règle Tableau 6.\n"
         "Sortie attendue: UNIQUEMENT un JSON valide (sans markdown) avec la forme:\n"
-        '{"levels": {"<rule_id>": <int|null>, ...}, "evidence": {"<rule_id>": ["extrait 1", ...]}, "unknowns": ["points à confirmer"]}\n\n'
+        "{\"levels\": {\"<rule_id>\": <int|null>, ...}, \"evidence\": {\"<rule_id>\": [\"extrait 1\", ...]}, \"unknowns\": [\"points à confirmer\"]}\n\n"
         "Règles STRICTES:\n"
         "- Si tu ne peux pas établir un niveau, mets null.\n"
         "- Ne calcule PAS les classes A/B/C/D.\n"
@@ -387,18 +478,8 @@ def infer_levels_with_llm(client, agg: Dict[str, Any], rules_doc: Dict[str, Any]
     return obj
 
 
-# -----------------------------
-# NEW: Part 2 slides prompt
-# -----------------------------
-
 def prompt_part2_scoring_slides(agg: Dict[str, Any], rules_doc: Dict[str, Any], building_scope: str, inferred: Dict[str, Any], group_scores: Dict[str, Any]) -> str:
-    """Ask LLaMA to format scoring into slide-ready markdown.
-
-    IMPORTANT: content source is the provided JSON; model only chooses layout / wording.
-    Renderer will split on '####' headings.
-    """
     digest = _digest_from_section_aggregate(agg, max_pages=12, max_blocks_per_page=2)
-
     payload = {
         "building_scope": building_scope,
         "inferred_levels": inferred.get('levels') or {},
@@ -407,7 +488,6 @@ def prompt_part2_scoring_slides(agg: Dict[str, Any], rules_doc: Dict[str, Any], 
         "group_scores": group_scores,
     }
 
-    # Provide a compact rules index to keep prompt smaller
     rules_index = []
     for r in rules_doc.get('rules', []):
         rules_index.append({
@@ -428,60 +508,18 @@ def prompt_part2_scoring_slides(agg: Dict[str, Any], rules_doc: Dict[str, Any], 
         "- Ne produis pas de macro-partie 4.\n\n"
         "Contenu attendu (minimum):\n"
         "1) Une slide 'Synthèse' (classes atteintes par usage/groupe)\n"
-        "2) Une slide par groupe (Chauffage / Refroidissement / Ventilation / ECS / Éclairage / Stores / GTB si présent)\n"
-        "   - rappeler la classe atteinte\n"
-        "   - lister 3-6 règles bloquantes vers B (si classe < B), avec (rule_id, niveau requis, niveau observé)\n"
-        "   - ajouter 1-2 extraits de preuves si disponibles dans inferred_evidence pour les règles bloquantes\n"
-        "3) Une slide 'Points à confirmer' (unknowns)\n\n"
+        "2) Une slide par groupe\n"
+        " - rappeler la classe atteinte\n"
+        " - lister 3-6 règles bloquantes vers B (si classe < B), avec (rule_id, niveau requis, niveau observé)\n"
+        " - ajouter 1-2 extraits de preuves si disponibles\n"
+        "3) Une slide 'Points à confirmer'\n\n"
         "=== CONTEXTE ONE NOTE (digest) ===\n"
         f"{digest}\n\n"
-        "=== RÈGLES (index, pour référence) ===\n"
+        "=== RÈGLES (index) ===\n"
         f"{json.dumps(rules_index, ensure_ascii=False, indent=2)[:6000]}\n\n"
         "=== DONNÉES DE SCORING (source unique) ===\n"
         f"{json.dumps(payload, ensure_ascii=False, indent=2)}\n"
     )
-
-
-# -----------------------------
-# Diagnostics helpers (per-section)
-# -----------------------------
-
-def keyword_hit_ratio(section: Dict[str, Any], text: str) -> float:
-    kws = [qs.norm(k) for k in (section.get("keywords") or []) if k]
-    t = qs.norm(text or "")
-    if not kws:
-        return 0.0
-    hits = sum(1 for k in kws if k and k in t)
-    return hits / len(kws)
-
-
-def detect_section_issues(section: Dict[str, Any], text: str) -> Tuple[List[str], Dict[str, Any]]:
-    mp = section.get("macro_part")
-    t = text or ""
-    forb = qs.INTENT_FORBIDDEN.get(mp, [])
-    forb_hits = qs.count_hits(t, forb)
-    ph_hits = qs.count_hits(t, qs.PLACEHOLDERS)
-    mp1_presc_hits = qs.count_hits(t, qs.PRESCRIPTIVE_MP1) if mp == 1 else 0
-    khr = keyword_hit_ratio(section, t)
-
-    issues: List[str] = []
-    if forb_hits:
-        issues.append(f"forbidden_terms_hits={forb_hits}")
-    if ph_hits:
-        issues.append(f"placeholders_hits={ph_hits}")
-    if mp1_presc_hits:
-        issues.append(f"mp1_prescriptive_hits={mp1_presc_hits}")
-    if (section.get("keywords") or []) and khr < 0.25:
-        issues.append(f"low_keyword_alignment={khr:.2f}")
-
-    metrics = {
-        "forbidden_hits": forb_hits,
-        "placeholder_hits": ph_hits,
-        "mp1_prescriptive_hits": mp1_presc_hits,
-        "keyword_hit_ratio": round(khr, 3),
-    }
-
-    return issues, metrics
 
 
 # -----------------------------
@@ -497,14 +535,14 @@ def main():
     ap.add_argument("--max_tokens", type=int, default=1200)
     ap.add_argument("--top_p", type=float, default=1.0)
 
-    ap.add_argument("--mode", choices=["single", "multistep"], default="single", help="single = one call per section; multistep = facts->write (+repair)")
+    ap.add_argument("--mode", choices=["single", "multistep"], default="multistep")
 
-    ap.add_argument("--facts_max_tokens", type=int, default=500)
+    ap.add_argument("--facts_max_tokens", type=int, default=650)
     ap.add_argument("--facts_temperature", type=float, default=0.0)
 
-    ap.add_argument("--repair_max_tokens", type=int, default=900)
+    ap.add_argument("--repair_max_tokens", type=int, default=1000)
     ap.add_argument("--repair_temperature", type=float, default=0.2)
-    ap.add_argument("--max_repairs", type=int, default=1)
+    ap.add_argument("--max_repairs", type=int, default=3)
 
     ap.add_argument("--min_quality", type=float, default=0.0)
     ap.add_argument("--quality", default="", help="Path to write quality_report.json")
@@ -512,13 +550,13 @@ def main():
     ap.add_argument("--retries", type=int, default=4)
     ap.add_argument("--retry_sleep", type=float, default=1.2)
 
-    # Tableau 6 (ISO 52120-1) scoring inputs
-    ap.add_argument("--section_aggregate", default="", help="Path to process/onenote_aggregates/<notebook>/<section_slug>.json")
-    ap.add_argument("--bacs_rules", default="", help="Path to Tableau 6 rules JSON (your full rules)")
-    ap.add_argument("--bacs_building_scope", default="Non résidentiel", choices=["Résidentiel", "Non résidentiel"], help="Scope for Tableau 6")
-    ap.add_argument("--bacs_targets", default="", help="Optional JSON file mapping group->target class for Part 3")
+    ap.add_argument("--strict_traceability", action="store_true", help="Require evidence markers when evidence exists.")
 
-    # NEW: slide generation for Part 2 using LLaMA
+    # Tableau 6 inputs
+    ap.add_argument("--section_aggregate", default="", help="Path to process/onenote_aggregates/<notebook>/<section_slug>.json")
+    ap.add_argument("--bacs_rules", default="", help="Path to Tableau 6 rules JSON")
+    ap.add_argument("--bacs_building_scope", default="Non résidentiel", choices=["Résidentiel", "Non résidentiel"])
+    ap.add_argument("--bacs_targets", default="", help="Optional JSON mapping group->target class for Part 3")
     ap.add_argument("--bacs_part2_slides", action="store_true", help="If set, Part 2 is generated by LLaMA as slide-ready markdown.")
 
     args = ap.parse_args()
@@ -532,10 +570,9 @@ def main():
         require_section_context(bundle, "draft_bundle.json")
 
     client = make_client()
-
     generated = dict(bundle)
 
-    # 1) Generate sections via LLM (existing behavior)
+    # 1) Generate sections via LLM
     for sec in generated.get("sections", []):
         base_prompt = (sec.get("prompt") or "").strip()
         if not base_prompt:
@@ -608,38 +645,24 @@ def main():
 
         if write_resp is None:
             sec["write_llm_error"] = write_err
-            sec["fallback_mode"] = "single_due_to_write_error"
-            single_resp, single_err = safe_chat(
-                client,
-                build_messages(base_prompt),
-                temperature=args.temperature,
-                max_tokens=args.max_tokens,
-                top_p=args.top_p,
-                retries=args.retries,
-                base_sleep=args.retry_sleep,
-            )
-            if single_resp is None:
-                sec["generated_text"] = ""
-                sec["final_text"] = ""
-                sec["llm_error"] = single_err
-                sec["llm_raw"] = None
-                continue
-            draft_text = (single_resp.text or "").strip()
-            sec["draft_text"] = draft_text
-            sec["llm_raw_write"] = single_resp.raw
-        else:
-            draft_text = (write_resp.text or "").strip()
-            sec["draft_text"] = draft_text
-            sec["llm_raw_write"] = write_resp.raw
+            sec["generated_text"] = ""
+            sec["final_text"] = ""
+            sec["llm_raw"] = None
+            continue
+
+        draft_text = (write_resp.text or "").strip()
+        sec["draft_text"] = draft_text
+        sec["llm_raw_write"] = write_resp.raw
 
         final_text = draft_text
+
+        # Repair loop
         repairs_done = 0
         while repairs_done < max(0, args.max_repairs):
-            issues, metrics = detect_section_issues(sec, final_text)
+            issues, metrics = detect_section_issues(sec, final_text, strict_traceability=args.strict_traceability)
             sec["section_metrics"] = metrics
             if not issues:
                 break
-
             rep_prompt = prompt_repair(sec, facts_obj, final_text, issues)
             rep_resp, rep_err = safe_chat(
                 client,
@@ -653,7 +676,6 @@ def main():
             if rep_resp is None:
                 sec.setdefault("repair_errors", []).append({"issues": issues, "error": rep_err})
                 break
-
             repaired = (rep_resp.text or "").strip()
             sec.setdefault("repair_attempts", []).append({
                 "issues": issues,
@@ -662,6 +684,11 @@ def main():
             })
             final_text = repaired
             repairs_done += 1
+
+        # Deterministic sanitizer (last resort)
+        sanitized = sanitize_text_for_intent(sec, final_text)
+        sec["sanitized"] = (sanitized != final_text)
+        final_text = sanitized
 
         sec["final_text"] = final_text
         sec["generated_text"] = final_text
@@ -694,18 +721,15 @@ def main():
         })
 
     # 3) Tableau 6 scoring injection for Part 2 & Part 3 (ISO 52120-1)
-    # Gated to BACS_SCORING to avoid overriding other report types.
     if (generated.get('report_type') == 'BACS_SCORING') and args.section_aggregate and args.bacs_rules:
         try:
             rules_doc = load_rules_json(args.bacs_rules)
             agg = load_json(Path(args.section_aggregate))
-
             inferred = infer_levels_with_llm(client, agg, rules_doc, args.bacs_building_scope, args.retries, args.retry_sleep)
             observed_levels = inferred.get('levels') or {}
-
             group_scores = compute_group_scores_from_table6(rules_doc, args.bacs_building_scope, observed_levels)
 
-            # Part 2: either deterministic markdown or LLaMA slide markdown
+            # Part 2
             if args.bacs_part2_slides:
                 p = prompt_part2_scoring_slides(agg, rules_doc, args.bacs_building_scope, inferred, group_scores)
                 resp, err = safe_chat(client, build_messages(p), temperature=0.2, max_tokens=1400, top_p=1.0, retries=args.retries, base_sleep=args.retry_sleep)
@@ -715,7 +739,6 @@ def main():
                 else:
                     part2_text = (resp.text or '').strip() + "\n"
             else:
-                # keep the existing deterministic formatter (compact)
                 lines = []
                 lines.append('## Scoring GTB actuel selon ISO 52120-1')
                 lines.append('')
@@ -730,7 +753,7 @@ def main():
                     lines.append('')
                 part2_text = '\n'.join(lines).strip() + '\n'
 
-            # Part 3: keep deterministic travaux list (target default B)
+            # Part 3
             target_by_group = {}
             if args.bacs_targets:
                 try:
@@ -800,7 +823,6 @@ def main():
     quality = evaluate_quality(generated, assembled)
     q_path = Path(args.quality) if args.quality else (out_dir / "quality_report.json")
     save_json(q_path, quality)
-
     print(f"Wrote: {q_path}")
     print(f"Quality total: {quality.get('total')} / 100")
 
