@@ -1,12 +1,13 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """run_pipeline.py
+
 Single entrypoint to run the full GTB / BACS report generation pipeline.
 
-PATCH (2026-03-06)
-- Adds Tableau 6 rules support (ISO 52120-1) for BACS_SCORING part 2 & 3.
-- Default rules path: input/rules/bacs_table6_rules_structured_clean.json
-- Optional flag: --bacs-part2-slides to have LLaMA generate slide-ready markdown for Part 2.
+PATCH (coherence process)
+- Always passes Tableau 6 rules to run_llm_jobs.py when rules file exists.
+  This enables deterministic Part 2 & 3 generation even when running by case-id
+  (i.e., without --onenote-section and without section_aggregate).
 
 Original pipeline stages remain unchanged.
 """
@@ -33,23 +34,19 @@ REPORT_TYPES_CONFIG = ROOT / "input" / "config" / "report_types.json"
 PROMPT_TEMPLATES = ROOT / "input" / "config" / "prompt_templates.json"
 PPTX_TEMPLATE = ROOT / "input" / "templates" / "TEMPLATE_AUDIT_BUILD4USE.pptx"
 
-# NEW: Tableau 6 rules default
 DEFAULT_BACS_RULES = ROOT / "input" / "rules" / "bacs_table6_rules_structured_clean.json"
 
 ONENOTE_EXPORT_ROOT = ROOT / "input" / "onenote-exporter" / "output"
-
 PROCESS_ROOT = ROOT / "process"
 ONENOTE_PROCESSED_ROOT = PROCESS_ROOT / "onenote"
 PLANS_ROOT = PROCESS_ROOT / "plans"
 DRAFTS_ROOT = PROCESS_ROOT / "drafts"
 SKELETONS_DIR = PROCESS_ROOT / "learning" / "skeletons"
-
 OUTPUT_ROOT = ROOT / "output"
 
 DEFAULT_MIN_QUALITY_SCORE = 75.0
-
 LLM_TEMPERATURE = "0.2"
-LLM_MAX_TOKENS = "1200"
+LLM_MAX_TOKENS = "1500"
 DEFAULT_LLM_MODE = "multistep"
 
 
@@ -63,18 +60,16 @@ def run(cmd: list[str], *, cwd: Path = ROOT):
 
 def main():
     ap = argparse.ArgumentParser(description="Run the GTB/BACS generation pipeline end-to-end.")
-
     ap.add_argument("--case-id", default=DEFAULT_CASE_ID)
     ap.add_argument("--notebook", default=DEFAULT_NOTEBOOK_NAME)
     ap.add_argument("--onenote-section", default=DEFAULT_ONENOTE_SECTION)
-
     ap.add_argument("--mode", choices=["single", "multistep"], default=DEFAULT_LLM_MODE)
     ap.add_argument("--min-quality", type=float, default=DEFAULT_MIN_QUALITY_SCORE)
 
-    # NEW: Tableau 6 rules for scoring
-    ap.add_argument("--bacs-rules", default=str(DEFAULT_BACS_RULES), help="Path to input/rules/bacs_table6_rules_structured_clean.json")
-    ap.add_argument("--bacs-building-scope", default="Non résidentiel", choices=["Résidentiel", "Non résidentiel"], help="Scope used for ISO 52120-1 scoring")
-    ap.add_argument("--bacs-part2-slides", action="store_true", help="Generate Part 2 as slide-ready markdown via LLaMA")
+    ap.add_argument("--bacs-rules", default=str(DEFAULT_BACS_RULES), help="Path to Tableau 6 rules JSON")
+    ap.add_argument("--bacs-building-scope", default="Non résidentiel", choices=["Résidentiel", "Non résidentiel"])
+    ap.add_argument("--bacs-targets", default="", help="Optional JSON mapping group->target class")
+    ap.add_argument("--bacs-part2-slides", action="store_true")
 
     args = ap.parse_args()
 
@@ -113,6 +108,7 @@ def main():
     ])
 
     # 2) Section aggregation
+    agg_path = None
     if onenote_section:
         run([
             sys.executable,
@@ -124,8 +120,8 @@ def main():
             "--out",
             str((ROOT / "process" / "onenote_aggregates")),
         ])
-
         agg_path = (ROOT / "process" / "onenote_aggregates" / notebook_name / f"{case_id}.json").resolve()
+
         agg_obj = json.loads(agg_path.read_text(encoding="utf-8"))
         if expected_ctx and isinstance(agg_obj.get("section_context"), dict):
             assert_same_section_context(expected_ctx, agg_obj["section_context"], "onenote_aggregate")
@@ -166,11 +162,8 @@ def main():
         "--out",
         str(DRAFTS_ROOT),
     ]
-
-    if onenote_section:
-        agg_path = (ROOT / "process" / "onenote_aggregates" / notebook_name / f"{case_id}.json").resolve()
+    if agg_path:
         cmd += ["--section-aggregate", str(agg_path)]
-
     run(cmd)
 
     if expected_ctx:
@@ -194,18 +187,16 @@ def main():
         str(min_quality),
     ]
 
-    # NEW: pass Tableau 6 rules when running in section mode AND rules file exists
     rules_path = Path(args.bacs_rules)
-    if onenote_section and rules_path.exists():
-        agg_path = (ROOT / "process" / "onenote_aggregates" / notebook_name / f"{case_id}.json").resolve()
+    if rules_path.exists():
         llm_cmd += [
-            "--section_aggregate",
-            str(agg_path),
             "--bacs_rules",
             str(rules_path),
             "--bacs_building_scope",
             args.bacs_building_scope,
         ]
+        if args.bacs_targets:
+            llm_cmd += ["--bacs_targets", args.bacs_targets]
         if args.bacs_part2_slides:
             llm_cmd += ["--bacs_part2_slides"]
 
