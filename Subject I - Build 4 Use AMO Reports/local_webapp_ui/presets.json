@@ -1,0 +1,24 @@
+{
+  "presets": [
+    {
+      "name": "BACS - Non résidentiel (défaut)",
+      "notebook": "test",
+      "onenote_section": "",
+      "case_id": "P050011",
+      "mode": "multistep",
+      "min_quality": 0.0,
+      "bacs_building_scope": "Non résidentiel",
+      "bacs_part2_slides": false
+    },
+    {
+      "name": "BACS - Résidentiel",
+      "notebook": "test",
+      "onenote_section": "",
+      "case_id": "P050011",
+      "mode": "multistep",
+      "min_quality": 0.0,
+      "bacs_building_scope": "Résidentiel",
+      "bacs_part2_slides": false
+    }
+  ]
+}
