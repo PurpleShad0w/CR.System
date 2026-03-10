@@ -1,0 +1,55 @@
+{
+  "version": "1.0",
+  "description": "Définit les types de slides et leur multiplicité (template à nombre variable).",
+  "types": {
+    "COVER": {
+      "repeatable": false,
+      "detect_tokens": [
+        "{{AUDIT_TYPE}}",
+        "{{CASE_CODE}}"
+      ]
+    },
+    "TOC": {
+      "repeatable": false,
+      "detect_tokens": [
+        "{{PART1_TITLE}}",
+        "Sommaire"
+      ]
+    },
+    "PART_DIVIDER": {
+      "repeatable": true,
+      "detect_tokens": [
+        "{{PART1_TITLE}}"
+      ],
+      "notes": "Slide d'ouverture de macro-partie"
+    },
+    "CONTENT_TEXT": {
+      "repeatable": true,
+      "detect_tokens": [
+        "{{SLIDE_TITLE}}",
+        "{{TEXTE_BULLETS}}"
+      ],
+      "max_images": 0
+    },
+    "CONTENT_TEXT_IMAGES": {
+      "repeatable": true,
+      "detect_tokens": [
+        "{{SLIDE_TITLE}}",
+        "{{TEXTE_BULLETS}}",
+        "{{IMAGE_1}}"
+      ],
+      "max_images": 3
+    },
+    "CONCLUSION": {
+      "repeatable": false,
+      "detect_tokens": [
+        "{{CONCLUSION_TEXTE}}",
+        "Conclusion"
+      ]
+    }
+  },
+  "defaults": {
+    "content_type": "CONTENT_TEXT",
+    "content_type_with_images": "CONTENT_TEXT_IMAGES"
+  }
+}

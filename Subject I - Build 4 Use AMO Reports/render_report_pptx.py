@@ -1,17 +1,32 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-"""render_report_pptx.py
+"""render_report_pptx.py (v2 - slide types)
 
-Render a final audit report PPTX from:
-- TEMPLATE_AUDIT_BUILD4USE.pptx (6-slide role template)
-- assembled_report.json (LLM output)
+Grounding
+---------
+The current template <File>TEMPLATE_AUDIT_BUILD4USE.pptx</File> already contains distinct placeholders
+for multiple content slide layouts (text-only and text+images). This renderer detects slide types
+from placeholder tokens and supports a variable number of slides.
 
-HARDENING (small additions)
---------------------------
-- Prefer the human-readable OneNote section name (from section_context) for the cover {{SITE}}.
-- Write PPTX core properties (title/subject) to encode section identity.
+Key changes vs v1
+-----------------
+- Introduces a slide-types catalog (JSON) with multiplicity (repeatable vs single).
+- Auto-detects which template slide corresponds to which type using token presence.
+- Keeps backward compatibility: if assembled_report.json has macro_parts/sections (legacy),
+  it renders as before.
+- Adds optional new schema: assembled_report.json may include top-level "slides" list.
 
-Renderer still only paginates; it does not interpret.
+New optional schema (slides)
+---------------------------
+{
+  "slides": [
+    {"type":"CONTENT_TEXT", "part":1, "title":"...", "bullets":"- ...", "images": []},
+    ...
+  ]
+}
+
+When "slides" is present, the renderer uses it; otherwise it falls back to macro_parts.
+
 """
 
 import argparse
@@ -20,16 +35,12 @@ import re
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, Any, List, Tuple
+from typing import Dict, Any, List, Optional
 
 from pptx import Presentation
 from pptx.util import Pt
 from pptx.enum.text import PP_ALIGN
 
-
-# -----------------------------
-# Helpers: load / normalize
-# -----------------------------
 
 def load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8"))
@@ -56,6 +67,7 @@ def split_text_for_slides(text: str, max_chars: int = 900, max_lines: int = 12) 
     text = normalize_whitespace(strip_markdown(text))
     if not text:
         return [""]
+
     paras = [p.strip() for p in text.split("\n\n") if p.strip()]
     chunks: List[str] = []
     cur = ""
@@ -68,9 +80,11 @@ def split_text_for_slides(text: str, max_chars: int = 900, max_lines: int = 12) 
         if len(candidate) <= max_chars and cur_lines(candidate) <= max_lines:
             cur = candidate
             continue
+
         if cur:
             chunks.append(cur)
             cur = ""
+
         if len(p) > max_chars or cur_lines(p) > max_lines:
             sentences = re.split(r"(?<=[\.!\?])\s+", p)
             s_cur = ""
@@ -92,6 +106,7 @@ def split_text_for_slides(text: str, max_chars: int = 900, max_lines: int = 12) 
 
     if cur:
         chunks.append(cur)
+
     return chunks if chunks else [""]
 
 
@@ -99,6 +114,7 @@ def split_section_into_slides(section_text: str):
     slides = []
     current_title = None
     current_lines: List[str] = []
+
     for line in section_text.splitlines():
         line = line.strip()
         if line.startswith("#### "):
@@ -108,8 +124,10 @@ def split_section_into_slides(section_text: str):
             current_lines = []
         else:
             current_lines.append(line)
+
     if current_title:
         slides.append({"title": current_title, "body": "\n".join(current_lines).strip()})
+
     return slides
 
 
@@ -120,12 +138,15 @@ def split_section_into_slides(section_text: str):
 def clone_slide(prs_out: Presentation, slide_in) -> Any:
     blank_layout = prs_out.slide_layouts[6]  # blank
     new_slide = prs_out.slides.add_slide(blank_layout)
+
     try:
         new_slide._element.get_or_add_bg()._set_bg(slide_in._element.get_or_add_bg())
     except Exception:
         pass
+
     for shape in slide_in.shapes:
         new_slide.shapes._spTree.insert_element_before(deepcopy(shape._element), 'p:extLst')
+
     return new_slide
 
 
@@ -159,12 +180,15 @@ def set_bullets_in_shape(shape, text: str, font_size_pt: int = 16):
     tf = shape.text_frame
     tf.clear()
     tf.word_wrap = True
+
     text = normalize_whitespace(strip_markdown(text))
     lines = [ln.strip() for ln in text.split("\n") if ln.strip()]
+
     if not lines:
         p = tf.paragraphs[0]
         p.text = ""
         return
+
     for i, ln in enumerate(lines):
         is_bullet = ln.startswith("- ")
         content = ln[2:].strip() if is_bullet else ln
@@ -181,37 +205,54 @@ def set_bullets_in_shape(shape, text: str, font_size_pt: int = 16):
 
 
 # -----------------------------
-# Build output deck
+# Slide type detection
 # -----------------------------
 
-def build_deck(template_path: Path, assembled_path: Path, out_path: Path):
+def slide_text(slide) -> str:
+    parts = []
+    for shape in slide.shapes:
+        if getattr(shape, "has_text_frame", False) and shape.has_text_frame:
+            parts.append(shape.text_frame.text)
+    return "\n".join(parts)
+
+
+def detect_template_slide_types(tpl: Presentation, slide_types_cfg: Dict[str, Any]) -> Dict[str, Any]:
+    """Return mapping: type -> slide_in (first matching slide)."""
+    types = (slide_types_cfg.get("types") or {})
+    found: Dict[str, Any] = {}
+
+    for slide in tpl.slides:
+        stxt = slide_text(slide)
+        for tname, tcfg in types.items():
+            tokens = tcfg.get("detect_tokens") or []
+            if tokens and all(tok in stxt for tok in tokens):
+                if tname not in found:
+                    found[tname] = slide
+
+    return found
+
+
+def build_deck(template_path: Path, assembled_path: Path, out_path: Path, slide_types_path: Optional[Path] = None):
     tpl = Presentation(str(template_path))
     data = load_json(assembled_path)
+
+    slide_types_cfg = load_json(slide_types_path) if slide_types_path and slide_types_path.exists() else {
+        "types": {}
+    }
+
+    catalog = detect_template_slide_types(tpl, slide_types_cfg)
 
     case_id = data.get("case_id") or assembled_path.stem
     report_type = data.get("report_type") or "AUDIT"
     today = datetime.now().strftime("%d/%m/%Y")
 
-    # HARDENING: prefer OneNote section name for site label
     section_ctx = data.get("section_context") or {}
     site_label = section_ctx.get("onenote_section_name") or case_id
-
-    macro_parts = data.get("macro_parts") or []
-
-    part_titles = {1: "Partie 1", 2: "Partie 2", 3: "Partie 3"}
-    for mp in macro_parts:
-        try:
-            mp_num = int(mp.get("macro_part"))
-            mp_name = mp.get("macro_part_name") or f"Partie {mp_num}"
-            part_titles[mp_num] = mp_name
-        except Exception:
-            pass
 
     prs_out = Presentation()
     prs_out.slide_width = tpl.slide_width
     prs_out.slide_height = tpl.slide_height
 
-    # HARDENING: PPTX core properties for traceability
     try:
         prs_out.core_properties.title = f"Rapport Audit – {site_label}"
         slug = section_ctx.get("section_slug") or case_id
@@ -219,14 +260,7 @@ def build_deck(template_path: Path, assembled_path: Path, out_path: Path):
     except Exception:
         pass
 
-    s_cover_in = tpl.slides[0]
-    s_toc_in = tpl.slides[1]
-    s_section_in = tpl.slides[2]
-    s_text_in = tpl.slides[4]
-    s_concl_in = tpl.slides[5]
-
-    # ---------- Cover ----------
-    s_cover = clone_slide(prs_out, s_cover_in)
+    # Core mappings
     cover_map = {
         "{{AUDIT_TYPE}}": report_type,
         "{{CLIENT}}": "N/A",
@@ -237,10 +271,17 @@ def build_deck(template_path: Path, assembled_path: Path, out_path: Path):
         "{{VERSION}}": "1",
         "{{CONTACT_EMAIL}}": "contact@build4use.eu",
     }
-    replace_placeholders(s_cover, cover_map)
 
-    # ---------- Sommaire ----------
-    s_toc = clone_slide(prs_out, s_toc_in)
+    # Part titles
+    part_titles = {1: "Partie 1", 2: "Partie 2", 3: "Partie 3"}
+    for mp in (data.get("macro_parts") or []):
+        try:
+            mp_num = int(mp.get("macro_part"))
+            mp_name = mp.get("macro_part_name") or f"Partie {mp_num}"
+            part_titles[mp_num] = mp_name
+        except Exception:
+            pass
+
     toc_map = {
         "{{PART1_TITLE}}": part_titles.get(1, "Partie 1"),
         "{{PART2_TITLE}}": part_titles.get(2, "Partie 2"),
@@ -251,89 +292,127 @@ def build_deck(template_path: Path, assembled_path: Path, out_path: Path):
         "{{VERSION}}": "1",
         "{{CONTACT_EMAIL}}": "contact@build4use.eu",
     }
-    replace_placeholders(s_toc, toc_map)
 
-    # ---------- Content for macro-parts 1..3 ----------
-    for mp_num in [1, 2, 3]:
-        mp = next((x for x in macro_parts if int(x.get("macro_part", -1)) == mp_num), None)
-        if not mp:
-            continue
-        mp_name = mp.get("macro_part_name") or f"Partie {mp_num}"
+    # ---- COVER ----
+    if "COVER" in catalog:
+        s_cover = clone_slide(prs_out, catalog["COVER"])
+        replace_placeholders(s_cover, cover_map)
 
-        s_sec = clone_slide(prs_out, s_section_in)
-        sec_map = {
-            "{{PART1_TITLE}}": mp_name,
+    # ---- TOC ----
+    if "TOC" in catalog:
+        s_toc = clone_slide(prs_out, catalog["TOC"])
+        replace_placeholders(s_toc, toc_map)
+
+    # ---- content generation ----
+    slides_spec = data.get("slides")
+
+    def emit_content_slide(stype: str, title: str, body: str, images: Optional[List[str]] = None):
+        images = images or []
+        slide_in = catalog.get(stype) or catalog.get("CONTENT_TEXT")
+        if not slide_in:
+            return
+        slide_out = clone_slide(prs_out, slide_in)
+        replace_placeholders(slide_out, {
+            "{{SLIDE_TITLE}}": title,
             "{{DATE}}": today,
             "{{VERSION}}": "1",
             "{{CONTACT_EMAIL}}": "contact@build4use.eu",
+        })
+
+        # bullets
+        shape = find_shape_containing(slide_out, "{{TEXTE_BULLETS}}")
+        if shape:
+            set_bullets_in_shape(shape, body, font_size_pt=16)
+
+        # images placeholders are left empty (renderer does not place actual images yet)
+        img_map = {
+            "{{IMAGE_1}}": images[0] if len(images) > 0 else "",
+            "{{IMAGE_2}}": images[1] if len(images) > 1 else "",
+            "{{IMAGE_3}}": images[2] if len(images) > 2 else "",
         }
-        replace_placeholders(s_sec, sec_map)
+        replace_placeholders(slide_out, img_map)
 
-        badge_num = f"{mp_num:02d}"
-        for sh in s_sec.shapes:
-            if getattr(sh, "has_text_frame", False) and sh.has_text_frame:
-                if sh.text_frame.text.strip() in {"01", "02", "03", "99"}:
-                    sh.text_frame.text = badge_num
+    # New schema path: explicit slides list
+    if isinstance(slides_spec, list) and slides_spec:
+        for s in slides_spec:
+            stype = (s.get("type") or "CONTENT_TEXT").strip()
+            title = (s.get("title") or "").strip()
+            body = (s.get("bullets") or s.get("body") or "").strip()
+            imgs = s.get("images") or []
+            emit_content_slide(stype, title, body, imgs)
 
-        for sec in mp.get("sections") or []:
-            bucket_id = sec.get("bucket_id") or "SECTION"
-            sec_text = sec.get("text") or ""
+    else:
+        # Legacy: macro_parts -> section divider + content slides
+        macro_parts = data.get("macro_parts") or []
 
-            subsection_slides = split_section_into_slides(sec_text)
-            if subsection_slides:
-                slide_items = []
-                for item in subsection_slides:
-                    stitle = (item.get("title") or "").strip() or bucket_id
-                    sbody = (item.get("body") or "").strip()
-                    body_chunks = split_text_for_slides(sbody, max_chars=900, max_lines=12)
-                    for cidx, chunk in enumerate(body_chunks, start=1):
-                        title = f"{bucket_id} – {stitle}"
-                        if len(body_chunks) > 1:
-                            title = f"{bucket_id} – {stitle} ({cidx}/{len(body_chunks)})"
-                        slide_items.append((title, chunk))
-            else:
-                chunks = split_text_for_slides(sec_text, max_chars=900, max_lines=12)
-                slide_items = []
-                for idx, chunk in enumerate(chunks, start=1):
-                    title = bucket_id
-                    if len(chunks) > 1:
-                        title = f"{bucket_id} ({idx}/{len(chunks)})"
-                    slide_items.append((title, chunk))
+        # Divider slide
+        divider_in = catalog.get("PART_DIVIDER")
 
-            for title, chunk in slide_items:
-                slide_out = clone_slide(prs_out, s_text_in)
-                replace_placeholders(slide_out, {
-                    "{{SLIDE_TITLE}}": title,
+        for mp_num in [1, 2, 3]:
+            mp = next((x for x in macro_parts if int(x.get("macro_part", -1)) == mp_num), None)
+            if not mp:
+                continue
+            mp_name = mp.get("macro_part_name") or f"Partie {mp_num}"
+
+            if divider_in:
+                s_div = clone_slide(prs_out, divider_in)
+                replace_placeholders(s_div, {
+                    "{{PART1_TITLE}}": mp_name,
                     "{{DATE}}": today,
                     "{{VERSION}}": "1",
                     "{{CONTACT_EMAIL}}": "contact@build4use.eu",
                 })
-                shape = find_shape_containing(slide_out, "{{TEXTE_BULLETS}}")
-                if shape:
-                    set_bullets_in_shape(shape, chunk, font_size_pt=16)
+                # replace badge numbers if present
+                badge_num = f"{mp_num:02d}"
+                for sh in s_div.shapes:
+                    if getattr(sh, "has_text_frame", False) and sh.has_text_frame:
+                        if sh.text_frame.text.strip() in {"01", "02", "03", "99"}:
+                            sh.text_frame.text = badge_num
+
+            for sec in mp.get("sections") or []:
+                bucket_id = sec.get("bucket_id") or "SECTION"
+                sec_text = sec.get("text") or ""
+
+                subsection_slides = split_section_into_slides(sec_text)
+                if subsection_slides:
+                    items = []
+                    for item in subsection_slides:
+                        stitle = (item.get("title") or "").strip() or bucket_id
+                        sbody = (item.get("body") or "").strip()
+                        body_chunks = split_text_for_slides(sbody, max_chars=900, max_lines=12)
+                        for cidx, chunk in enumerate(body_chunks, start=1):
+                            t = f"{bucket_id} – {stitle}"
+                            if len(body_chunks) > 1:
+                                t = f"{bucket_id} – {stitle} ({cidx}/{len(body_chunks)})"
+                            items.append((t, chunk))
                 else:
-                    for sh in slide_out.shapes:
-                        if getattr(sh, "has_text_frame", False) and sh.has_text_frame:
-                            set_bullets_in_shape(sh, chunk, font_size_pt=16)
-                            break
+                    chunks = split_text_for_slides(sec_text, max_chars=900, max_lines=12)
+                    items = []
+                    for idx, chunk in enumerate(chunks, start=1):
+                        t = bucket_id if len(chunks) == 1 else f"{bucket_id} ({idx}/{len(chunks)})"
+                        items.append((t, chunk))
 
-    # ---------- Conclusion ----------
-    s_concl = clone_slide(prs_out, s_concl_in)
-    conclusion_text = ""
-    mp3 = next((x for x in macro_parts if int(x.get("macro_part", -1)) == 3), None)
-    if mp3 and (mp3.get("sections") or []):
-        last_txt = mp3["sections"][-1].get("text") or ""
-        last_txt = normalize_whitespace(strip_markdown(last_txt))
-        conclusion_text = last_txt[:900]
-    if not conclusion_text:
-        conclusion_text = "Synthèse à compléter (données de conclusion non fournies dans l'export)."
+                for title, chunk in items:
+                    emit_content_slide(slide_types_cfg.get("defaults", {}).get("content_type", "CONTENT_TEXT"), title, chunk, [])
 
-    replace_placeholders(s_concl, {
-        "{{CONCLUSION_TEXTE}}": conclusion_text,
-        "{{DATE}}": today,
-        "{{VERSION}}": "1",
-        "{{CONTACT_EMAIL}}": "contact@build4use.eu",
-    })
+    # ---- CONCLUSION ----
+    if "CONCLUSION" in catalog:
+        concl_in = catalog["CONCLUSION"]
+        s_concl = clone_slide(prs_out, concl_in)
+        conclusion_text = ""
+        mp3 = next((x for x in (data.get("macro_parts") or []) if int(x.get("macro_part", -1)) == 3), None)
+        if mp3 and (mp3.get("sections") or []):
+            last_txt = mp3["sections"][-1].get("text") or ""
+            last_txt = normalize_whitespace(strip_markdown(last_txt))
+            conclusion_text = last_txt[:900]
+        if not conclusion_text:
+            conclusion_text = "Synthèse à compléter (données de conclusion non fournies dans l'export)."
+        replace_placeholders(s_concl, {
+            "{{CONCLUSION_TEXTE}}": conclusion_text,
+            "{{DATE}}": today,
+            "{{VERSION}}": "1",
+            "{{CONTACT_EMAIL}}": "contact@build4use.eu",
+        })
 
     prs_out.save(str(out_path))
 
@@ -343,8 +422,10 @@ def main():
     ap.add_argument("--template", required=True, help="Path to TEMPLATE_AUDIT_BUILD4USE.pptx")
     ap.add_argument("--assembled", required=True, help="Path to assembled_report.json")
     ap.add_argument("--out", default="Rapport_Audit.pptx", help="Output PPTX path")
+    ap.add_argument("--slide-types", default="input/config/slide_types.json", help="Path to slide_types.json")
     args = ap.parse_args()
-    build_deck(Path(args.template), Path(args.assembled), Path(args.out))
+
+    build_deck(Path(args.template), Path(args.assembled), Path(args.out), Path(args.slide_types))
     print(f"Wrote: {args.out}")
 
 
