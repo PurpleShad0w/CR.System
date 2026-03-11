@@ -55,6 +55,13 @@ LLM_MAX_TOKENS = "1500"
 DEFAULT_LLM_MODE = "multistep"
 
 
+try:
+    sys.stdout.reconfigure(errors="replace")
+    sys.stderr.reconfigure(errors="replace")
+except Exception:
+    pass
+
+
 def run(cmd: list[str], *, cwd: Path = ROOT):
     print("\n▶", " ".join(cmd))
     res = subprocess.run(cmd, cwd=cwd)
