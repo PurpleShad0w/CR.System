@@ -1,15 +1,25 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""run_llm_jobs.py (escape-safe)
+"""run_llm_jobs.py
 
-This patch fixes escaping issues by using raw regex strings and avoids emitting
-client-visible evidence references.
+Implements 4 improvement axes for dense OneNote sections:
 
-Key fixes vs the previous patch:
-- Slide splitting: Part 1 is split per #### heading, then chunked into multiple slides.
-- Evidence: lines containing 'Preuve:' or 'page_id=' are moved to evidence_trace, not to client.
-- Client deck: strips any remaining [P#] references.
-- Images: attaches dict entries {path, caption} so legends can be filled.
+A) Part 1 thematic interpretation (automatic):
+   - Build multiple theme slides from the section aggregate (not only LLM text).
+
+B) Deterministic "Inventaire / Liste des équipements" slide:
+   - Extract from OneNote page titled like "Liste des équipements".
+
+C) Evidence / image diversity:
+   - Prefer covering all available pages (avoid repeating the same page_id).
+
+D) Part 2/3 enriched (visuals + short explanations):
+   - Add images per group when available and a short explanation sentence.
+
+Notes:
+- Client deck never contains raw OneNote ids (page_id=) nor 'Preuve:' lines.
+- Internal trace keeps exhaustive evidence.
+
 """
 
 from __future__ import annotations
@@ -41,6 +51,10 @@ except Exception:
     pass
 
 
+# -----------------------------
+# IO
+# -----------------------------
+
 def load_json(p: Path) -> Dict[str, Any]:
     return json.loads(p.read_text(encoding='utf-8'))
 
@@ -48,6 +62,10 @@ def load_json(p: Path) -> Dict[str, Any]:
 def save_json(p: Path, obj: Dict[str, Any]) -> None:
     p.write_text(json.dumps(obj, ensure_ascii=False, indent=2), encoding='utf-8')
 
+
+# -----------------------------
+# LLM helpers
+# -----------------------------
 
 def build_messages(prompt: str) -> List[Dict[str, str]]:
     return [
@@ -57,7 +75,7 @@ def build_messages(prompt: str) -> List[Dict[str, str]]:
 
 
 def safe_chat(client, messages, *, temperature: float, max_tokens: int, top_p: float = 1.0,
-              retries: int = 4, base_sleep: float = 1.2) -> Tuple[Optional[Any], Optional[str]]:
+    retries: int = 4, base_sleep: float = 1.2) -> Tuple[Optional[Any], Optional[str]]:
     last_err = None
     for attempt in range(retries + 1):
         try:
@@ -96,7 +114,10 @@ def prompt_write_part1_from_pack(section: Dict[str, Any], pack: Dict[str, Any]) 
     )
 
 
-# Evidence extraction
+# -----------------------------
+# Evidence extraction (client vs internal)
+# -----------------------------
+
 RE_EVIDENCE_LINE = re.compile(r"^(\s*[-•]?\s*)?(preuve\s*:|.*\bpage_id\s*=)", re.IGNORECASE)
 RE_PAGE_ID = re.compile(r"\bpage_id\s*=\s*([^\s,;]+)", re.IGNORECASE)
 
@@ -111,9 +132,10 @@ def extract_client_text_and_trace(raw_text: str, *, origin: str, trace_start_ind
     p_idx = trace_start_index
 
     for ln in lines:
-        if RE_EVIDENCE_LINE.search(ln.strip()):
+        s = ln.strip()
+        if RE_EVIDENCE_LINE.search(s):
             ref = f"P{p_idx}"
-            trace.append({"ref": ref, "origin": origin, "raw": ln.strip()})
+            trace.append({"ref": ref, "origin": origin, "raw": s})
             p_idx += 1
             continue
         out_lines.append(ln)
@@ -126,7 +148,157 @@ def extract_client_text_and_trace(raw_text: str, *, origin: str, trace_start_ind
     return client_text, trace
 
 
-# OneNote page index + captions
+def strip_client_noise(text: str) -> str:
+    """Remove automation smell tokens that still appear in generated text."""
+    if not text:
+        return ''
+    t = re.sub(r"\bConstat\s*:\s*", "", text, flags=re.IGNORECASE)
+    t = re.sub(r"\[P\d+\]", "", t)
+    t = re.sub(r"\n{3,}", "\n\n", t)
+    return t.strip()
+
+
+# -----------------------------
+# OneNote aggregate reader
+# -----------------------------
+
+def _norm(s: str) -> str:
+    s = (s or '').lower().strip()
+    s = s.replace('é', 'e').replace('è', 'e').replace('ê', 'e').replace('ë', 'e')
+    s = s.replace('à', 'a').replace('â', 'a').replace('ä', 'a')
+    s = s.replace('î', 'i').replace('ï', 'i')
+    s = s.replace('ô', 'o').replace('ö', 'o')
+    s = s.replace('û', 'u').replace('ü', 'u')
+    s = re.sub(r"\s+", " ", s)
+    return s
+
+
+def locate_section_aggregate(bundle_path: Path, bundle: Dict[str, Any]) -> Optional[Path]:
+    ctx = bundle.get('section_context') or {}
+    notebook = ctx.get('onenote_notebook')
+    slug = ctx.get('section_slug')
+    if not notebook or not slug:
+        return None
+    # project root = bundle_path.parent.parent.parent? actually bundle is process/drafts/<case>/draft_bundle.json
+    project_root = bundle_path.parent.parent.parent.parent
+    cand = project_root / 'process' / 'onenote_aggregates' / str(notebook) / f"{slug}.json"
+    if cand.exists():
+        return cand
+    return None
+
+
+def aggregate_pages(agg: Dict[str, Any]) -> List[Dict[str, Any]]:
+    pages = agg.get('pages') or []
+    out = []
+    for p in pages:
+        pid = p.get('page_id') or p.get('id')
+        title = p.get('title') or ''
+        blocks = p.get('text_blocks') or []
+        # Flatten blocks into lines
+        lines = []
+        for b in blocks:
+            txt = (b.get('text') or '').strip()
+            if not txt:
+                continue
+            for ln in txt.splitlines():
+                ln = ln.strip()
+                if ln:
+                    lines.append(ln)
+        out.append({
+            'page_id': pid,
+            'title': title,
+            'lines': lines,
+            'num_images': int(p.get('num_images') or 0),
+        })
+    return out
+
+
+def extract_equipment_list(pages: List[Dict[str, Any]]) -> List[str]:
+    """Find the equipment list page and extract bullet-like items."""
+    best = None
+    for p in pages:
+        if 'liste des equipements' in _norm(p.get('title')):
+            best = p
+            break
+    if best is None:
+        # fallback: any page with many equipment-like tokens
+        for p in pages:
+            if 'equipement' in _norm(' '.join(p.get('lines') or [])):
+                best = p
+                break
+    if best is None:
+        return []
+
+    items: List[str] = []
+    for ln in best.get('lines') or []:
+        s = ln.strip()
+        if not s:
+            continue
+        # bullet forms
+        if s.startswith(('-', '•')):
+            s = s.lstrip('-•').strip()
+        # remove emoji numbering
+        s = re.sub(r"^[0-9]+[)\.\-]\s*", "", s)
+        s = re.sub(r"^[\U0001F300-\U0001FAFF]+\s*", "", s)
+        # keep short-ish lines (equipment entries)
+        if 2 <= len(s) <= 120:
+            items.append(s)
+    # de-dup preserving order
+    seen = set()
+    out = []
+    for it in items:
+        k = _norm(it)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(it)
+    return out
+
+
+def theme_definitions() -> List[Dict[str, Any]]:
+    return [
+        {'key': 'contexte', 'title': 'Contexte & objectifs', 'keywords': ['contexte', 'objectif', 'mission', 'decret', 'bacs', 'classe', 'em eis', 'idex', 'schneider', 'integrateur']},
+        {'key': 'architecture', 'title': 'Architecture GTB / supervision', 'keywords': ['gtb', 'supervision', 'ebo', 'tac', 'vista', 'workstation', 'automate', 'bacnet', 'lon']},
+        {'key': 'comptage', 'title': 'Comptage & suivi des consommations', 'keywords': ['comptage', 'diris', 'tgbt', 'kwh', 'compteur', 'energie', 'eau', 'calorie', 'frigorie']},
+        {'key': 'alarmes', 'title': 'Alarmes & historisation', 'keywords': ['alarme', 'defaut', 'histor', 'derive', 'reporting', 'diagnostic']},
+    ]
+
+
+def extract_theme_bullets(pages: List[Dict[str, Any]], theme: Dict[str, Any]) -> Tuple[List[str], List[str]]:
+    """Return (bullets, page_ids_used) for a theme."""
+    kws = [_norm(k) for k in (theme.get('keywords') or [])]
+    bullets: List[str] = []
+    used_pages: List[str] = []
+
+    for p in pages:
+        pid = p.get('page_id')
+        lines = p.get('lines') or []
+        for ln in lines:
+            n = _norm(ln)
+            if any(k in n for k in kws):
+                # transform into a concise bullet
+                b = ln.strip()
+                if len(b) > 170:
+                    b = b[:167].rstrip() + '…'
+                bullets.append(b)
+                if pid and pid not in used_pages:
+                    used_pages.append(pid)
+
+    # de-dup bullets
+    seen = set()
+    out = []
+    for b in bullets:
+        k = _norm(b)
+        if k in seen:
+            continue
+        seen.add(k)
+        out.append(b)
+    return out, used_pages
+
+
+# -----------------------------
+# Image resolution and diversity
+# -----------------------------
 
 def load_page_index(onenote_root: Path) -> Dict[str, Dict[str, Any]]:
     pages_dir = onenote_root / 'pages'
@@ -149,13 +321,17 @@ def short_caption(text: str) -> str:
     if not t:
         return ''
     t = t.split('\n', 1)[0].strip()
+    # keep manual-like captions short
     if len(t) > 60:
         t = t[:57].rstrip() + '…'
     return t
 
 
-def resolve_images_for_page_ids(page_index: Dict[str, Dict[str, Any]], page_ids: List[str], *, max_images: int = 6) -> List[Dict[str, Any]]:
+def resolve_images_for_page_ids(page_index: Dict[str, Dict[str, Any]], page_ids: List[str], *, max_images: int = 6,
+    per_page_cap: int = 2) -> List[Dict[str, Any]]:
+    """Diverse selection: max per_page_cap images per page_id."""
     out: List[Dict[str, Any]] = []
+    counts: Dict[str, int] = {}
     for pid in page_ids:
         obj = page_index.get(pid)
         if not obj:
@@ -164,6 +340,10 @@ def resolve_images_for_page_ids(page_index: Dict[str, Dict[str, Any]], page_ids:
         assets = obj.get('assets') or {}
         images = assets.get('images') or []
         for im in images:
+            if len(out) >= max_images:
+                return out
+            if counts.get(pid, 0) >= per_page_cap:
+                break
             path = None
             cap = None
             if isinstance(im, str):
@@ -175,21 +355,56 @@ def resolve_images_for_page_ids(page_index: Dict[str, Dict[str, Any]], page_ids:
                 cap = page_title
             if path:
                 out.append({'path': path, 'caption': short_caption(cap), 'page_id': pid, 'page_title': page_title})
-            if len(out) >= max_images:
-                return out
+                counts[pid] = counts.get(pid, 0) + 1
     return out
 
 
-# Slide splitting
+def diverse_page_order(pages: List[Dict[str, Any]], preferred: List[str]) -> List[str]:
+    """Return page_ids starting with preferred, then remaining, preserving uniqueness."""
+    all_ids = [p.get('page_id') for p in pages if p.get('page_id')]
+    seen = set()
+    out = []
+    for pid in preferred + all_ids:
+        if not pid or pid in seen:
+            continue
+        seen.add(pid)
+        out.append(pid)
+    return out
 
-def normalize_ws(s: str) -> str:
-    s = (s or '').replace('\r\n', '\n').replace('\r', '\n')
-    s = re.sub(r"\n{3,}", "\n\n", s)
-    return s.strip()
+
+# -----------------------------
+# Slide building utilities
+# -----------------------------
+
+def bullets_from_text(text: str) -> List[str]:
+    text = strip_client_noise(text)
+    text = (text or '').replace('\r\n', '\n').replace('\r', '\n')
+    lines = [ln.strip() for ln in text.split('\n') if ln.strip()]
+    bullets = []
+    for ln in lines:
+        if ln.startswith('- '):
+            bullets.append(ln)
+        elif ln.startswith('•'):
+            bullets.append('- ' + ln.lstrip('•').strip())
+        else:
+            # keep short sentences as bullets
+            if len(ln) <= 170:
+                bullets.append('- ' + ln)
+    return bullets
+
+
+def chunk_bullets(bullets: List[str], max_bullets: int = 10) -> List[str]:
+    if not bullets:
+        return ['']
+    chunks = []
+    for i in range(0, len(bullets), max_bullets):
+        chunks.append('\n'.join(bullets[i:i + max_bullets]))
+    return chunks
 
 
 def split_by_h4(md: str) -> List[Tuple[str, str]]:
-    md = normalize_ws(md)
+    md = (md or '').replace('\r\n', '\n').replace('\r', '\n')
+    md = re.sub(r"\n{3,}", "\n\n", md).strip()
     if not md:
         return []
     cur_title: Optional[str] = None
@@ -209,31 +424,50 @@ def split_by_h4(md: str) -> List[Tuple[str, str]]:
     return out
 
 
-def to_bullets(body: str) -> List[str]:
-    body = normalize_ws(body)
-    bullets: List[str] = []
-    for ln in body.splitlines():
-        s = ln.strip()
-        if not s:
+# -----------------------------
+# Part 2/3 enrichment helpers
+# -----------------------------
+
+def group_keywords() -> Dict[str, List[str]]:
+    return {
+        'Chauffage': ['chaufferie', 'chaudiere', 'radiateur', 'pac', 'loi d', 'pompe'],
+        'ECS': ['ecs', 'eau chaude', 'ballon', 'bouclage'],
+        'Refroidissement': ['refroid', 'groupe froid', 'eau glacee', 'pac'],
+        'Ventilation': ['cta', 'ventilation', 'vmc', 'soufflage', 'reprise', 'co2'],
+        'Éclairage': ['eclairage', 'luminaire', 'detecteur de presence'],
+        'Stores': ['store'],
+        'GTB': ['gtb', 'supervision', 'ebo', 'tac', 'vista', 'automate', 'bacnet', 'lon'],
+    }
+
+
+def choose_group_images(pages: List[Dict[str, Any]], page_index: Dict[str, Dict[str, Any]], group: str, *, max_images: int = 2) -> List[Dict[str, Any]]:
+    kws = [_norm(k) for k in group_keywords().get(group, [])]
+    preferred = []
+    for p in pages:
+        pid = p.get('page_id')
+        if not pid:
             continue
-        if s.startswith('- '):
-            bullets.append(s)
-        elif s.lower().startswith('constat'):
-            bullets.append('- ' + s)
-        else:
-            if len(s) <= 160:
-                bullets.append('- ' + s)
-    return bullets
+        blob = _norm(p.get('title', '') + ' ' + ' '.join(p.get('lines') or []))
+        if any(k in blob for k in kws):
+            preferred.append(pid)
+    order = diverse_page_order(pages, preferred)
+    return resolve_images_for_page_ids(page_index, order, max_images=max_images, per_page_cap=1)
 
 
-def chunk_bullets(bullets: List[str], max_bullets: int = 10) -> List[str]:
-    if not bullets:
-        return ['']
-    chunks: List[str] = []
-    for i in range(0, len(bullets), max_bullets):
-        chunks.append('\n'.join(bullets[i:i + max_bullets]))
-    return chunks
+def group_explanation(group: str, group_score: Dict[str, Any]) -> str:
+    ach = (group_score or {}).get('achieved_class') or ''
+    block_b = ((group_score or {}).get('blockers') or {}).get('B') or []
+    nb = len(block_b)
+    if not ach:
+        return ''
+    if nb:
+        return f"Classe {ach} : {nb} exigence(s) minimales vers la classe B ne sont pas démontrées dans les notes / preuves disponibles."
+    return f"Classe {ach} : les exigences minimales vers la classe B semblent satisfaites sur la base des preuves disponibles."
 
+
+# -----------------------------
+# Main
+# -----------------------------
 
 def main() -> None:
     ap = argparse.ArgumentParser()
@@ -267,6 +501,11 @@ def main() -> None:
 
     page_index = load_page_index(Path(args.onenote)) if args.onenote else {}
 
+    # Load section aggregate if available
+    agg_path = locate_section_aggregate(bundle_path, bundle)
+    agg_obj = load_json(agg_path) if agg_path else None
+    agg_pages = aggregate_pages(agg_obj) if isinstance(agg_obj, dict) else []
+
     # BACS scoring (deterministic)
     bacs_meta = None
     rules_doc = None
@@ -278,7 +517,7 @@ def main() -> None:
         digest = build_digest_from_bundle(generated)
         prompt = build_level_inference_prompt_from_digest(digest, rules_doc, args.bacs_building_scope)
         resp, err = safe_chat(client, build_messages(prompt), temperature=0.0, max_tokens=1900, top_p=1.0,
-                              retries=args.retries, base_sleep=args.retry_sleep)
+            retries=args.retries, base_sleep=args.retry_sleep)
         if resp is None:
             inferred = {'levels': {}, 'evidence': {}, 'unknowns': [f'LLM error: {err}']}
         else:
@@ -288,7 +527,7 @@ def main() -> None:
         group_scores = compute_group_scores_from_table6(rules_doc, args.bacs_building_scope, observed_levels)
         bacs_meta = {'building_scope': args.bacs_building_scope, 'inferred': inferred, 'group_scores': group_scores}
 
-    # LLM generation for Part 1
+    # LLM generation for Part 1 only (kept)
     for sec in generated.get('sections', []):
         mp = sec.get('macro_part')
         base_prompt = (sec.get('prompt') or '').strip()
@@ -305,7 +544,7 @@ def main() -> None:
         sec['evidence_pack'] = pack
         write_prompt = prompt_write_part1_from_pack(sec, pack) if mp == 1 else base_prompt
         resp, err = safe_chat(client, build_messages(write_prompt), temperature=args.temperature, max_tokens=args.max_tokens,
-                              top_p=args.top_p, retries=args.retries, base_sleep=args.retry_sleep)
+            top_p=args.top_p, retries=args.retries, base_sleep=args.retry_sleep)
         sec['final_text'] = (resp.text or '').strip() if resp else ''
         if err:
             sec['llm_error'] = err
@@ -326,6 +565,7 @@ def main() -> None:
         'case_id': generated.get('case_id'),
         'report_type': generated.get('report_type'),
         'section_context': generated.get('section_context'),
+        'created_from': str(bundle_path),
         'evidence_trace': [],
         'full_text_by_section': [],
     }
@@ -343,6 +583,7 @@ def main() -> None:
             origin = f"mp{mp}:{s.get('bucket_id') or 'SECTION'}"
             client_text, trace_items = extract_client_text_and_trace(raw, origin=origin, trace_start_index=trace_cursor)
             trace_cursor += len(trace_items)
+            client_text = strip_client_noise(client_text)
             mp_obj['sections'].append({'bucket_id': s.get('bucket_id'), 'text': client_text})
             assembled['evidence_trace'].extend(trace_items)
             internal_trace['evidence_trace'].extend(trace_items)
@@ -353,7 +594,9 @@ def main() -> None:
         assembled['bacs_table6'] = bacs_meta
         internal_trace['bacs_table6'] = bacs_meta
 
-    # Build slides: Part 1 only here (extend similarly for Part 2/3 if desired)
+    # -----------------------------
+    # Build slides[] (4 axes)
+    # -----------------------------
     slides: List[Dict[str, Any]] = []
 
     def add_div(part: int, title: str):
@@ -366,34 +609,120 @@ def main() -> None:
         except Exception:
             pass
 
+    # ---- Part 1 ----
     mp1 = next((x for x in assembled['macro_parts'] if int(x.get('macro_part', -1)) == 1), None)
     if mp1:
         add_div(1, ptitle.get(1, 'Etat des lieux GTB'))
+
+        # B) Deterministic equipment inventory slide
+        equipment_items = extract_equipment_list(agg_pages) if agg_pages else []
+        inv_bullets = ['- ' + it for it in equipment_items[:24]]
+        if not inv_bullets:
+            inv_bullets = ['- À confirmer (liste d\'équipements non trouvée dans les artefacts)']
+
+        # Diverse images: prefer equipment page then others
+        preferred_pids = []
+        for p in agg_pages:
+            if 'liste des equipements' in _norm(p.get('title')):
+                if p.get('page_id'):
+                    preferred_pids.append(p.get('page_id'))
+        order = diverse_page_order(agg_pages, preferred_pids)
+        inv_imgs = resolve_images_for_page_ids(page_index, order, max_images=4, per_page_cap=1) if page_index else []
+
+        slides.append({
+            'type': 'CONTENT_TEXT_IMAGES' if inv_imgs else 'CONTENT_TEXT',
+            'part': 1,
+            'title': 'Inventaire / équipements mentionnés',
+            'bullets': '\n'.join(inv_bullets),
+            'images': inv_imgs,
+        })
+
+        # A) Automatic theme slides from aggregate
+        if agg_pages:
+            for th in theme_definitions():
+                bullets_raw, used_pids = extract_theme_bullets(agg_pages, th)
+                if not bullets_raw:
+                    continue
+                # limit and chunk
+                bullets = ['- ' + b.lstrip('-• ').strip() for b in bullets_raw][:30]
+                chunks = chunk_bullets(bullets, max_bullets=10)
+                pid_order = diverse_page_order(agg_pages, used_pids)
+                imgs = resolve_images_for_page_ids(page_index, pid_order, max_images=4, per_page_cap=1) if page_index else []
+                for ci, chunk in enumerate(chunks):
+                    slides.append({
+                        'type': 'CONTENT_TEXT_IMAGES' if imgs else 'CONTENT_TEXT',
+                        'part': 1,
+                        'title': th.get('title') + ('' if ci == 0 else f" ({ci+1})"),
+                        'bullets': chunk,
+                        'images': imgs if ci == 0 else [],
+                    })
+
+        # Existing LLM section text (fallback, but chunked)
         for sec in mp1.get('sections', []):
             bucket = sec.get('bucket_id') or 'SECTION'
             text = sec.get('text') or ''
-
             blocks = split_by_h4(text)
             if not blocks:
                 blocks = [(bucket, text)]
-
             orig = next((s for s in (generated.get('sections') or []) if int(s.get('macro_part') or 0) == 1 and s.get('bucket_id') == bucket), None)
-            imgs: List[Dict[str, Any]] = []
-            if orig and page_index:
-                pids = [p.get('page_id') for p in (orig.get('top_pages') or []) if p.get('page_id')]
-                imgs = resolve_images_for_page_ids(page_index, pids, max_images=6)
-
+            pref = [p.get('page_id') for p in (orig.get('top_pages') or []) if p.get('page_id')] if orig else []
+            pid_order = diverse_page_order(agg_pages, pref) if agg_pages else pref
+            imgs = resolve_images_for_page_ids(page_index, pid_order, max_images=4, per_page_cap=1) if page_index else []
             for h, body in blocks:
-                bullets = to_bullets(body)
-                for chunk in chunk_bullets(bullets, max_bullets=10):
+                buls = bullets_from_text(body)
+                for ci, chunk in enumerate(chunk_bullets(buls, max_bullets=10)):
                     slides.append({
                         'type': 'CONTENT_TEXT_IMAGES' if imgs else 'CONTENT_TEXT',
                         'part': 1,
                         'title': h or bucket,
                         'bullets': chunk,
-                        'images': imgs,
+                        'images': imgs if ci == 0 else [],
                     })
-                    imgs = []  # images only on first slide of the block
+                    imgs = []
+
+    # ---- Part 2 (D: visuals + explanation) ----
+    if bacs_meta and isinstance(group_scores, dict) and group_scores:
+        add_div(2, ptitle.get(2, 'Scoring GTB actuel'))
+        # Scorecard
+        lines = []
+        for grp, sc in group_scores.items():
+            lines.append(f"- {grp}: classe {sc.get('achieved_class')}")
+        slides.append({'type': 'CONTENT_TEXT', 'part': 2, 'title': 'Scorecard (synthèse)', 'bullets': '\n'.join(lines[:12]), 'images': []})
+        # per-group
+        for grp, sc in group_scores.items():
+            expl = group_explanation(grp, sc)
+            block_b = ((sc.get('blockers') or {}).get('B') or [])
+            bul = [f"- {expl}" ] if expl else []
+            bul.append(f"- Classe atteinte : {sc.get('achieved_class')}")
+            if block_b:
+                bul.append("- Top 3 manquants bloquants (vers classe B):")
+                for b in block_b[:3]:
+                    bul.append(f"  - {b.get('rule_id')} — {b.get('title')}")
+            imgs = choose_group_images(agg_pages, page_index, grp, max_images=2) if (agg_pages and page_index) else []
+            slides.append({'type': 'CONTENT_TEXT_IMAGES' if imgs else 'CONTENT_TEXT', 'part': 2, 'title': grp, 'bullets': '\n'.join(bul), 'images': imgs})
+
+    # ---- Part 3 (D: visuals + better framing) ----
+    if bacs_meta and isinstance(group_scores, dict) and group_scores:
+        add_div(3, ptitle.get(3, 'Scoring projeté'))
+        # Synthesis
+        synth = ["- Synthèse des écarts vers la cible (classe B)"]
+        for grp, sc in group_scores.items():
+            block_b = ((sc.get('blockers') or {}).get('B') or [])
+            synth.append(f"- {grp}: {len(block_b)} écart(s) vers classe B")
+        slides.append({'type': 'CONTENT_TEXT', 'part': 3, 'title': 'Synthèse (chemin critique)', 'bullets': '\n'.join(synth), 'images': []})
+        # Action plan per group (short)
+        for grp, sc in group_scores.items():
+            block_b = ((sc.get('blockers') or {}).get('B') or [])
+            if not block_b:
+                continue
+            bul = ["- Priorité 1 (bloquants):"]
+            for b in block_b[:6]:
+                bul.append(f"  - {b.get('rule_id')} — {b.get('title')}")
+            bul.append("- Priorité 2 (optimisation):")
+            for b in block_b[6:10]:
+                bul.append(f"  - {b.get('rule_id')} — {b.get('title')}")
+            imgs = choose_group_images(agg_pages, page_index, grp, max_images=2) if (agg_pages and page_index) else []
+            slides.append({'type': 'CONTENT_TEXT_IMAGES' if imgs else 'CONTENT_TEXT', 'part': 3, 'title': f"Plan d'action — {grp}", 'bullets': '\n'.join(bul), 'images': imgs})
 
     assembled['slides'] = slides
 

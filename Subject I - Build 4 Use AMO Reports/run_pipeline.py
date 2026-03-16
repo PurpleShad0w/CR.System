@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""run_pipeline.py (escape-safe)
+"""run_pipeline.py
 
-Only change: passes the boss info template if present under
-input/templates/Templates Slides.pptx.
+No functional change besides passing the boss info template when present.
 """
+
+from __future__ import annotations
 
 import argparse
 import json

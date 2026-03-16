@@ -1,14 +1,16 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
-r"""render_report_pptx.py (escape-safe)
+"""render_report_pptx.py
 
-Combined fix (base template + boss info template) with safe escaping.
+Renderer (base template + boss info template).
 
 - Base template: cover / TOC / part dividers / conclusion
-- Info template (Templates Slides.pptx): content slides
+- Info template (Templates Slides.pptx): content slides with images + legends
 
-This version avoids fragile escape sequences by using raw regex patterns and raw
-replacement strings where applicable (e.g. r"\1").
+Supports slides[].images as list of:
+- str paths
+- dicts {path, caption, page_id, page_title}
+
 """
 
 from __future__ import annotations
@@ -26,17 +28,9 @@ from pptx.util import Pt
 from pptx.enum.text import PP_ALIGN
 
 
-# -----------------------------
-# IO
-# -----------------------------
-
 def load_json(path: Path) -> Dict[str, Any]:
     return json.loads(path.read_text(encoding='utf-8'))
 
-
-# -----------------------------
-# Text helpers
-# -----------------------------
 
 def normalize_whitespace(text: str) -> str:
     t = (text or '').replace('\r\n', '\n').replace('\r', '\n')
@@ -56,7 +50,6 @@ def strip_markdown(text: str) -> str:
 
 
 def sanitize_client_body(text: str) -> str:
-    """Remove evidence traces from content that should not be client-visible."""
     if not text:
         return ''
     t = normalize_whitespace(strip_markdown(text))
@@ -75,27 +68,6 @@ def sanitize_client_body(text: str) -> str:
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
 
-def first_bullet_key(body: str) -> str:
-    t = sanitize_client_body(body)
-    for ln in t.splitlines():
-        s = ln.strip()
-        if not s:
-            continue
-        if s.startswith('- '):
-            return s[2:].strip()[:90]
-        if s.lower().startswith('constat'):
-            return s[:90]
-    for ln in t.splitlines():
-        s = ln.strip()
-        if s:
-            return s[:90]
-    return ''
-
-
-# -----------------------------
-# PPTX cloning
-# -----------------------------
-
 def clone_slide(prs_out: Presentation, slide_in) -> Any:
     blank_layout = prs_out.slide_layouts[6]
     new_slide = prs_out.slides.add_slide(blank_layout)
@@ -107,10 +79,6 @@ def clone_slide(prs_out: Presentation, slide_in) -> Any:
         new_slide.shapes._spTree.insert_element_before(deepcopy(shape._element), 'p:extLst')
     return new_slide
 
-
-# -----------------------------
-# Placeholder replacement (base template)
-# -----------------------------
 
 def replace_text_in_shape(shape, mapping: Dict[str, str]) -> None:
     if not getattr(shape, 'has_text_frame', False) or not shape.has_text_frame:
@@ -150,10 +118,6 @@ def detect_template_slide_types(tpl: Presentation, slide_types_cfg: Dict[str, An
     return found
 
 
-# -----------------------------
-# Info template helpers
-# -----------------------------
-
 def find_shape_containing(slide, token: str):
     for shape in slide.shapes:
         if getattr(shape, 'has_text_frame', False) and shape.has_text_frame:
@@ -189,22 +153,14 @@ def set_bullets(shape, body: str, *, font_size_pt: int = 16, max_lines: int = 14
     if not getattr(shape, 'has_text_frame', False) or not shape.has_text_frame:
         return
     tf = shape.text_frame
-    tf.clear()
-    tf.word_wrap = True
-
+    tf.clear(); tf.word_wrap = True
     body = sanitize_client_body(body)
     lines = [ln.strip() for ln in normalize_whitespace(strip_markdown(body)).split('\n') if ln.strip()]
-
-    norm_lines: List[str] = []
-    for ln in lines:
-        norm_lines.append(ln if ln.startswith('- ') else ('- ' + ln))
-    norm_lines = norm_lines[:max_lines]
-
-    if not norm_lines:
+    lines = [ln if ln.startswith('- ') else ('- ' + ln) for ln in lines][:max_lines]
+    if not lines:
         tf.paragraphs[0].text = ''
         return
-
-    for i, ln in enumerate(norm_lines):
+    for i, ln in enumerate(lines):
         content = ln[2:].strip()
         p = tf.paragraphs[0] if i == 0 else tf.add_paragraph()
         p.text = content
@@ -253,15 +209,12 @@ def fill_legends(slide, images: List[Any]) -> None:
     pairs = _images_to_pairs(images)
     legend_shapes = find_shapes_exact(slide, 'Légende Photo')
     pic_shapes = [sh for sh in slide.shapes if getattr(sh, 'shape_type', None) == 13]
-
     if not pairs:
         for sh in legend_shapes:
             set_text(sh, '')
         return
-
     assignments: Dict[int, int] = {}
     unused = set(range(len(legend_shapes)))
-
     for i, pic in enumerate(pic_shapes):
         best = None
         best_dist = None
@@ -278,7 +231,6 @@ def fill_legends(slide, images: List[Any]) -> None:
         if best is not None:
             assignments[i] = best
             unused.remove(best)
-
     for i, (path, cap) in enumerate(pairs):
         cap = (cap or '').strip() or Path(path).stem
         cap = cap.replace('_', ' ').strip()
@@ -289,33 +241,28 @@ def fill_legends(slide, images: List[Any]) -> None:
             j = i
         if j is not None and j < len(legend_shapes):
             set_text(legend_shapes[j], cap)
-
     for j in unused:
         set_text(legend_shapes[j], '')
 
 
 def fill_info_slide(slide, *, title: str, body: str, part_label: str, page_label: str,
-                    images: List[Any], base_dir: Path) -> None:
-    # Clear stray placeholders like "User flow" if present
+    images: List[Any], base_dir: Path) -> None:
+    # clear template placeholders
     for sh in find_shapes_exact(slide, 'User flow'):
         set_text(sh, '')
-
     # Title
     ts = find_shape_containing(slide, 'Titre section')
     if ts:
         set_text(ts, title)
-
     # Part label
     ps = find_shape_containing(slide, 'Etat des lieux')
     if ps and part_label:
         set_text(ps, part_label)
-
-    # Page label
+    # Page
     pg = find_shape_containing(slide, 'Page')
     if pg and page_label:
         set_text(pg, page_label)
-
-    # Main body
+    # Body
     body_shape = None
     for sh in slide.shapes:
         if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
@@ -324,25 +271,25 @@ def fill_info_slide(slide, *, title: str, body: str, part_label: str, page_label
                 break
     if body_shape:
         set_bullets(body_shape, body)
-
     # Info clé
     detail = find_shape_containing(slide, 'Texte Détail Info Clé')
     if detail:
-        set_text(detail, first_bullet_key(body))
-
+        # simple: first line without '- '
+        first = ''
+        for ln in sanitize_client_body(body).split('\n'):
+            ln = ln.strip()
+            if ln:
+                first = ln.lstrip('- ').strip()
+                break
+        set_text(detail, first[:90] if first else '')
     fill_legends(slide, images)
     overlay_images(slide, images, base_dir)
 
 
-# -----------------------------
-# Build deck
-# -----------------------------
-
 def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_types_path: Path,
-               info_template: Optional[Path] = None) -> None:
+    info_template: Optional[Path] = None) -> None:
     base_tpl = Presentation(str(base_template))
     data = load_json(assembled_path)
-
     slide_types_cfg = load_json(slide_types_path) if slide_types_path.exists() else {'types': {}, 'defaults': {}}
     catalog = detect_template_slide_types(base_tpl, slide_types_cfg)
 
@@ -360,7 +307,6 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
     prs_out.slide_width = base_tpl.slide_width
     prs_out.slide_height = base_tpl.slide_height
 
-    # Part titles
     part_titles: Dict[int, str] = {1: 'Partie 1', 2: 'Partie 2', 3: 'Partie 3', 4: '', 5: ''}
     for mp in (data.get('macro_parts') or []):
         try:
@@ -389,12 +335,9 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
         **global_map,
     }
 
-    # COVER
     if 'COVER' in catalog:
         s_cover = clone_slide(prs_out, catalog['COVER'])
         replace_placeholders(s_cover, cover_map)
-
-    # TOC
     if 'TOC' in catalog:
         s_toc = clone_slide(prs_out, catalog['TOC'])
         replace_placeholders(s_toc, global_map)
@@ -409,7 +352,7 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
         s_div = clone_slide(prs_out, slide_in)
         apply_global(s_div)
         replace_placeholders(s_div, {'{{PART1_TITLE}}': title})
-        badge = f'{int(part):02d}'
+        badge = f"{int(part):02d}"
         for sh in s_div.shapes:
             if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
                 if (sh.text_frame.text or '').strip() in {'01', '02', '03', '99'}:
@@ -421,45 +364,37 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
         body = (s.get('bullets') or s.get('body') or '')
         images = s.get('images') or []
         part = int(s.get('part') or 0)
-
         if info_tpl and stype in ('CONTENT_TEXT', 'CONTENT_TEXT_IMAGES') and (info_slide6 or info_slide4):
             pairs = _images_to_pairs(images)
             chosen = info_slide6 if (len(pairs) > 4 and info_slide6 is not None) else (info_slide4 or info_slide6)
-            if chosen is None:
-                pass
-            else:
+            if chosen is not None:
                 slide_out = clone_slide(prs_out, chosen)
                 part_label_map = {1: 'Etat des lieux', 2: 'Scoring actuel', 3: 'Scoring projeté'}
                 part_label = part_label_map.get(part, '')
-                page_label = f'Page {idx_in_part}' if idx_in_part else ''
-                fill_info_slide(slide_out, title=title, body=body, part_label=part_label,
-                                page_label=page_label, images=images, base_dir=assembled_path.parent)
+                page_label = f"Page {idx_in_part}" if idx_in_part else ''
+                fill_info_slide(slide_out, title=title, body=body, part_label=part_label, page_label=page_label,
+                    images=images, base_dir=assembled_path.parent)
                 return
-
-        # Fallback base content slide
+        # fallback base content
         slide_in = catalog.get(stype) or catalog.get('CONTENT_TEXT')
         if not slide_in:
             return
         slide_out = clone_slide(prs_out, slide_in)
         apply_global(slide_out)
         replace_placeholders(slide_out, {'{{SLIDE_TITLE}}': title})
-
-        # Replace body placeholder at shape text level
         for sh in slide_out.shapes:
-            if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
-                if '{{TEXTE_BULLETS}}' in (sh.text_frame.text or ''):
-                    sh.text_frame.text = ''
-                    set_bullets(sh, body)
+            if getattr(sh, 'has_text_frame', False) and sh.has_text_frame and '{{TEXTE_BULLETS}}' in (sh.text_frame.text or ''):
+                sh.text_frame.text = ''
+                set_bullets(sh, body)
 
     slides_spec = data.get('slides')
     per_part_counter = {1: 0, 2: 0, 3: 0}
-
     if isinstance(slides_spec, list) and slides_spec:
         for s in slides_spec:
             stype = (s.get('type') or 'CONTENT_TEXT').strip()
             if stype == 'PART_DIVIDER':
                 part = int(s.get('part') or 0)
-                emit_part_divider(part, (s.get('title') or '').strip() or f'Partie {part}')
+                emit_part_divider(part, (s.get('title') or '').strip() or f"Partie {part}")
                 if part in per_part_counter:
                     per_part_counter[part] = 0
                 continue
@@ -468,13 +403,12 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
                 per_part_counter[part] += 1
             emit_content_slide(s, per_part_counter.get(part, 0))
 
-    # CONCLUSION (optional)
     if 'CONCLUSION' in catalog:
         s_conc = clone_slide(prs_out, catalog['CONCLUSION'])
         apply_global(s_conc)
         replace_placeholders(s_conc, {'{{CONCLUSION_TEXTE}}': sanitize_client_body(data.get('conclusion', '') or '')[:900] or 'Synthèse à compléter.'})
 
-    # Guardrails
+    # guardrails
     offenders: List[Tuple[int, str]] = []
     for si, sl in enumerate(prs_out.slides, start=1):
         for sh in sl.shapes:
@@ -483,7 +417,7 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
                 if '{{' in txt or 'page_id=' in txt:
                     offenders.append((si, txt.strip().replace('\n', ' ')[:160]))
     if offenders:
-        preview = ' | '.join([f'S{a}: {b}' for a, b in offenders[:6]])
+        preview = ' | '.join([f"S{a}: {b}" for a, b in offenders[:6]])
         raise SystemExit('❌ Unreplaced template tokens or page_id leak detected. Offenders: ' + preview)
 
     prs_out.save(str(out_path))
@@ -499,8 +433,8 @@ def main() -> None:
     args = ap.parse_args()
 
     build_deck(Path(args.template), Path(args.assembled), Path(args.out), Path(args.slide_types),
-               Path(args.info_template) if args.info_template else None)
-    print(f'Wrote: {args.out}')
+        Path(args.info_template) if args.info_template else None)
+    print(f"Wrote: {args.out}")
 
 
 if __name__ == '__main__':
