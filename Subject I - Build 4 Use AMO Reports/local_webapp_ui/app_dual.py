@@ -13,10 +13,10 @@ if str(SRC) not in sys.path:
 	sys.path.insert(0, str(SRC))
 
 from legacy.legacy_runner import run_legacy, run_page_cards
+from legacy.section_names import DEFAULT_SECTION_NAME, normalize_section_name
 
 
 def load_presets() -> list[dict]:
-	# Prefer input/config/presets.json (exists in your repo) and fallback to root presets.json
 	for p in (REPO_ROOT / 'input' / 'config' / 'presets.json', REPO_ROOT / 'presets.json'):
 		if p.exists():
 			try:
@@ -40,7 +40,8 @@ def main():
 	with st.sidebar:
 		st.header('Common')
 		case_id = st.text_input('case_id', value='')
-		section_name = st.text_input('OneNote section name', value='')
+		section_name = st.text_input('OneNote section name', value=DEFAULT_SECTION_NAME)
+		section_name = normalize_section_name(section_name)
 		st.markdown('---')
 		st.write('Outputs go to output/reports/<case_id>/')
 
@@ -71,14 +72,11 @@ def main():
 
 			code, out = run_page_cards(argv)
 			log_area.code(out or '(no output)')
-			if code == 0:
-				st.success('Page Cards completed')
-			else:
-				st.error(f'Page Cards failed (exit={code})')
+			st.success('Page Cards completed') if code == 0 else st.error(f'Page Cards failed (exit={code})')
 
 	else:
 		st.subheader('Legacy pipeline (full)')
-		st.caption('This runs run_pipeline.py (your classic legacy entrypoint).')
+		st.caption('Runs run_pipeline.py. Auto-tries section name variants to avoid casing/dash mismatches.')
 
 		presets = load_presets()
 		selected = None
@@ -104,8 +102,7 @@ def main():
 			argv = []
 			if notebook:
 				argv += ['--notebook', notebook]
-			if onenote_section:
-				argv += ['--onenote-section', onenote_section]
+			argv += ['--onenote-section', normalize_section_name(onenote_section or section_name)]
 			if case_id:
 				argv += ['--case-id', case_id]
 			if mode_:
@@ -119,10 +116,7 @@ def main():
 
 			code, out = run_legacy(argv)
 			log_area.code(out or '(no output)')
-			if code == 0:
-				st.success('Legacy pipeline completed')
-			else:
-				st.error(f'Legacy pipeline failed (exit={code})')
+			st.success('Legacy pipeline completed') if code == 0 else st.error(f'Legacy pipeline failed (exit={code})')
 
 
 if __name__ == '__main__':

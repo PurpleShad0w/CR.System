@@ -5,7 +5,16 @@ from __future__ import annotations
 
 import argparse
 import subprocess
+import sys
 from pathlib import Path
+
+# Make `src/` importable so `import legacy...` works when running as a script
+REPO_ROOT = Path(__file__).resolve().parents[2]
+SRC = REPO_ROOT / 'src'
+if str(SRC) not in sys.path:
+	sys.path.insert(0, str(SRC))
+
+from legacy.section_names import DEFAULT_SECTION_NAME, normalize_section_name
 
 
 def _run(cmd: list[str]) -> None:
@@ -15,9 +24,9 @@ def _run(cmd: list[str]) -> None:
 
 def main() -> None:
 	ap = argparse.ArgumentParser()
-	ap.add_argument('--pages-index', required=True)
+	ap.add_argument('--pages-index', required=False, default='process/onenote/manifest.json', help='pages_index.json or manifest.json')
 	ap.add_argument('--case-id', required=True)
-	ap.add_argument('--section-name', default='')
+	ap.add_argument('--section-name', default=DEFAULT_SECTION_NAME)
 	ap.add_argument('--template', default='input/templates/Templates Slides.pptx')
 	ap.add_argument('--slide-types', default='input/config/slide_types.json')
 	ap.add_argument('--renderer', default='render_report_pptx.py')
@@ -30,7 +39,7 @@ def main() -> None:
 	out_pptx = Path(args.out) if args.out else Path(f'output/reports/{args.case_id}/Part1_PageCards.pptx')
 	out_pptx.parent.mkdir(parents=True, exist_ok=True)
 
-	section = args.section_name or args.case_id
+	section = normalize_section_name(args.section_name or DEFAULT_SECTION_NAME)
 
 	_run([
 		'python',
