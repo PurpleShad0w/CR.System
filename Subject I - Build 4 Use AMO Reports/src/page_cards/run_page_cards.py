@@ -21,11 +21,54 @@ def _run(cmd: list[str]) -> None:
 	subprocess.check_call(cmd)
 
 
+def maybe_run_process_onenote(args) -> Path:
+	"""Ensure process_onenote output exists.
+
+	process_onenote.py writes:
+	process/onenote/<notebook>/manifest.json
+	process/onenote/<notebook>/pages/*.json
+
+	OCR is parsed from [[IMAGE OCR]] lines into blocks type 'image_ocr' (no flag needed).
+	Audio transcription is enabled only if --audio-transcribe is passed.
+	"""
+	manifest = REPO_ROOT / 'process' / 'onenote' / args.notebook / 'manifest.json'
+	if not args.ensure_onenote:
+		return manifest
+	if manifest.exists():
+		return manifest
+
+	cmd = [
+		args.python_exe,
+		str(REPO_ROOT / 'process_onenote.py'),
+		args.notebook,
+		'--input', str(Path(args.onenote_input)),
+		'--out', str(Path(args.onenote_out)),
+	]
+	if args.audio_transcribe:
+		cmd.append('--transcribe')
+	if args.copy_assets:
+		cmd.append('--copy-assets')
+	_run(cmd)
+	return manifest
+
+
 def main() -> None:
 	ap = argparse.ArgumentParser()
-	ap.add_argument('--pages-index', default='process/onenote/manifest.json')
 	ap.add_argument('--case-id', required=True)
 	ap.add_argument('--section-name', default=DEFAULT_SECTION_NAME)
+
+	# process_onenote wiring
+	ap.add_argument('--ensure-onenote', action='store_true', default=True)
+	ap.add_argument('--no-ensure-onenote', action='store_false', dest='ensure_onenote')
+	ap.add_argument('--notebook', default='test')
+	ap.add_argument('--onenote-input', default='input/onenote-exporter/output')
+	ap.add_argument('--onenote-out', default='process/onenote')
+	ap.add_argument('--audio-transcribe', action='store_true', default=True, help='Pass --transcribe to process_onenote.py (audio).')
+	ap.add_argument('--copy-assets', action='store_true', default=False)
+	ap.add_argument('--python-exe', default=sys.executable or 'python')
+
+	# page cards
+	ap.add_argument('--pages-index', default='', help='Override pages source (manifest.json). If empty, uses process/onenote/<notebook>/manifest.json.')
 	ap.add_argument('--template', default='input/templates/Templates Slides.pptx')
 	ap.add_argument('--slide-types', default='input/config/slide_types_template_slides.json')
 	ap.add_argument('--renderer', default='render_report_pptx.py')
@@ -34,16 +77,18 @@ def main() -> None:
 	ap.add_argument('--max-bullets', type=int, default=10)
 	args = ap.parse_args()
 
+	manifest = maybe_run_process_onenote(args)
+	pages_src = Path(args.pages_index) if args.pages_index else manifest
+
+	section = normalize_section_name(args.section_name or DEFAULT_SECTION_NAME)
 	assembled = Path('process/page_cards/assembled_page_cards.json')
 	out_pptx = Path(args.out) if args.out else Path(f'output/reports/{args.case_id}/Part1_PageCards.pptx')
 	out_pptx.parent.mkdir(parents=True, exist_ok=True)
 
-	section = normalize_section_name(args.section_name or DEFAULT_SECTION_NAME)
-
 	_run([
-		'python',
+		args.python_exe,
 		'src/page_cards/build_page_cards_assembled.py',
-		'--pages-index', args.pages_index,
+		'--pages-index', str(pages_src),
 		'--out', str(assembled),
 		'--case-id', args.case_id,
 		'--section-name', section,
@@ -52,7 +97,7 @@ def main() -> None:
 	])
 
 	_run([
-		'python',
+		args.python_exe,
 		args.renderer,
 		'--template', args.template,
 		'--assembled', str(assembled),
