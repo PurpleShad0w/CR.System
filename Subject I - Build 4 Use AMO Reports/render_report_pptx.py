@@ -1,33 +1,35 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
+"""render_report_pptx.py (Templates Slides focus)
 
-r"""render_report_pptx.py
+Renderer for the Page Cards pipeline using "Templates Slides.pptx".
 
-Hotfix: use existing picture shapes as "slots" and replace their embedded image.
+Patch (2026-03-26): fixes two recurring issues reported in production:
+  1) Grey frames / dummy picture slots still visible.
+     - If an image cannot be resolved/embedded, we now REMOVE (or neutralize) the slot instead
+       of leaving the template dummy picture.
+     - When a slot is removed, we delete a wider cluster of companion shapes (frames/gradients).
+     - When a slot is filled, we also try to neutralize the picture outline/shadow and remove
+       small overlay/frame shapes that overlap the slot.
 
-Context
--------
-In "Templates Slides.pptx", the image locations are not real PowerPoint placeholders after
-we clone the slide by copying XML. Your logs show placeholders=0 on every slide.
-You also clarified that the template uses the **same dummy image** repeated for all slots.
+  2) Missing legends.
+     - Captions are read from assembled JSON (images: [{'path':..., 'caption':...}, ...]).
+     - Legend shapes are detected more robustly (case-insensitive, whitespace-normalized), and
+       also inside GROUP shapes.
+     - Captions are assigned to the nearest legend for each kept slot (spatial pairing).
 
-Therefore, the most robust approach is:
-- find the existing PICTURE shapes on the cloned slide (they are the slots)
-- replace the picture's blip relationship (r:embed) to point to the new image
+Patch v2 (2026-03-26): fix crash on unhashable Shape
+  - Shapes are unhashable in python-pptx; we track used legends by id(shape).
 
-This keeps:
-- the template picture style (shadow/gradient) because the shape stays the same
-- the correct z-order (legends remain visible)
+CLI (unchanged)
+----------------
+python render_report_pptx.py --template <pptx> --assembled <json> --out <pptx> --slide-types <json> [--project-root <path>]
 
-Legends
--------
-Legends are updated only by replacing text in existing text boxes containing "Légende Photo".
-
-Escape safety
--------------
-- Regex patterns and backrefs use raw strings.
-- Backslashes shown as "\\n".
-
+Notes
+-----
+- This file remains self-contained and avoids placeholder APIs because placeholders may not be
+  preserved when cloning slides by XML copy.
+- We keep XML clone strategy, but we no longer rely on leaving template dummy images as-is.
 """
 
 from __future__ import annotations
@@ -39,20 +41,27 @@ import time
 from copy import deepcopy
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple, Iterable
 
 from pptx import Presentation
+from pptx.dml.color import RGBColor
 from pptx.enum.shapes import MSO_SHAPE_TYPE
-from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE
-from pptx.util import Pt
+from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
 from pptx.oxml.ns import qn
+from pptx.util import Pt
 
 from PIL import Image
 
+# ----------------------------
+# JSON helpers
+# ----------------------------
 
 def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding='utf-8'))
+    return json.loads(path.read_text(encoding='utf-8', errors='replace'))
 
+# ----------------------------
+# Text helpers
+# ----------------------------
 
 def normalize_whitespace(text: str) -> str:
     t = (text or '').replace('\r\n', '\n').replace('\r', '\n')
@@ -89,14 +98,14 @@ def sanitize_client_body(text: str) -> str:
         out.append(ln)
     return re.sub(r"\n{3,}", "\n\n", "\n".join(out)).strip()
 
-
 # ----------------------------
-# Template slide cloning
+# Slide cloning / type detection
 # ----------------------------
 
 def clone_slide(prs_out: Presentation, slide_in) -> Any:
     blank_layout = prs_out.slide_layouts[6]
     new_slide = prs_out.slides.add_slide(blank_layout)
+    # background
     try:
         new_slide._element.get_or_add_bg()._set_bg(slide_in._element.get_or_add_bg())
     except Exception:
@@ -125,9 +134,23 @@ def detect_template_slide_types(tpl: Presentation, slide_types_cfg: Dict[str, An
                 found.setdefault(tname, sl)
     return found
 
+# ----------------------------
+# Shape iteration helpers (supports GROUP shapes)
+# ----------------------------
+
+def iter_shapes(obj) -> Iterable[Any]:
+    """Yield shapes from a slide or group, recursively for groups."""
+    for sh in getattr(obj, 'shapes', []):
+        yield sh
+        try:
+            if sh.shape_type == MSO_SHAPE_TYPE.GROUP:
+                for sub in iter_shapes(sh):
+                    yield sub
+        except Exception:
+            continue
 
 # ----------------------------
-# Placeholder text replacement
+# Text placement
 # ----------------------------
 
 def replace_text_in_shape(shape, mapping: Dict[str, str]) -> None:
@@ -144,14 +167,14 @@ def replace_text_in_shape(shape, mapping: Dict[str, str]) -> None:
 
 
 def replace_placeholders(slide, mapping: Dict[str, str]) -> None:
-    for shape in slide.shapes:
+    for shape in iter_shapes(slide):
         replace_text_in_shape(shape, mapping)
 
 
 def _set_title_any(slide_out, title: str) -> None:
     if not title:
         return
-    for sh in slide_out.shapes:
+    for sh in iter_shapes(slide_out):
         if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
             txt = sh.text_frame.text or ''
             if '{{SLIDE_TITLE}}' in txt or 'Titre section' in txt:
@@ -174,6 +197,7 @@ def set_bullets_fit(shape, body: str, *, max_lines: int = 12, min_font_pt: int =
         out.append(s)
     if len(out) > max_lines:
         out = out[:max_lines-1] + ['…']
+    # clear existing
     for p in tf.paragraphs:
         p.text = ''
     if not out:
@@ -183,8 +207,8 @@ def set_bullets_fit(shape, body: str, *, max_lines: int = 12, min_font_pt: int =
         p.text = s
         p.level = 0
         p.alignment = PP_ALIGN.LEFT
-    tf.word_wrap = True
     try:
+        tf.word_wrap = True
         tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
     except Exception:
         pass
@@ -197,16 +221,15 @@ def set_bullets_fit(shape, body: str, *, max_lines: int = 12, min_font_pt: int =
 
 
 def _set_body_any(slide_out, body: str, *, max_lines: int) -> None:
-    for sh in slide_out.shapes:
+    for sh in iter_shapes(slide_out):
         if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
             txt = sh.text_frame.text or ''
             if '{{TEXTE_BULLETS}}' in txt or 'Texte Texte' in txt:
                 set_bullets_fit(sh, body, max_lines=max_lines)
                 return
 
-
 # ----------------------------
-# Image resolution + conversion
+# Image path resolution + conversion
 # ----------------------------
 
 _img_cache: Dict[str, Optional[Path]] = {}
@@ -330,9 +353,128 @@ def _crop_to_fill(pic_shape, img_path: Path, box_w: int, box_h: int) -> None:
     except Exception:
         return
 
+# ----------------------------
+# Geometry + deletion helpers
+# ----------------------------
 
-def pick_picture_slots(slide) -> List[Any]:
-    """Return the existing PICTURE shapes (slots) ordered top/left."""
+def _rect(sh) -> Tuple[int, int, int, int]:
+    return (int(getattr(sh, 'left', 0)), int(getattr(sh, 'top', 0)), int(getattr(sh, 'width', 0)), int(getattr(sh, 'height', 0)))
+
+
+def _area(r: Tuple[int, int, int, int]) -> int:
+    return max(0, r[2]) * max(0, r[3])
+
+
+def _intersection(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> int:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0
+    return (ix2 - ix1) * (iy2 - iy1)
+
+
+def _center(r: Tuple[int, int, int, int]) -> Tuple[float, float]:
+    return (r[0] + r[2] / 2.0, r[1] + r[3] / 2.0)
+
+
+def _near_rect(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> bool:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    return (
+        abs(ax - bx) <= max(60000, int(aw * 0.05)) and
+        abs(ay - by) <= max(60000, int(ah * 0.05)) and
+        abs(aw - bw) <= max(120000, int(aw * 0.08)) and
+        abs(ah - bh) <= max(120000, int(ah * 0.08))
+    )
+
+
+def _remove_shape(slide, shape) -> bool:
+    try:
+        slide.shapes._spTree.remove(shape._element)
+        return True
+    except Exception:
+        return False
+
+
+def _remove_slot_cluster(slide, slot_shape) -> None:
+    """Remove slot picture + any overlay/frame shapes tied to it."""
+    slot_r = _rect(slot_shape)
+    slot_a = _area(slot_r)
+    if slot_a <= 0:
+        _remove_shape(slide, slot_shape)
+        return
+    cx, cy = _center(slot_r)
+    _remove_shape(slide, slot_shape)
+    companions = []
+    for sh in list(slide.shapes):
+        if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
+            continue
+        r = _rect(sh)
+        a = _area(r)
+        if a <= 0:
+            continue
+        if a > slot_a * 8.0:
+            continue
+        inter = _intersection(slot_r, r)
+        over_slot = inter / slot_a
+        over_min = inter / float(min(slot_a, a)) if min(slot_a, a) else 0.0
+        rx, ry = _center(r)
+        prox = (abs(rx - cx) <= slot_r[2] * 0.35 and abs(ry - cy) <= slot_r[3] * 0.35)
+        near = _near_rect(slot_r, r)
+        if over_slot >= 0.08 or over_min >= 0.18 or prox or near:
+            companions.append(sh)
+    for sh in companions:
+        _remove_shape(slide, sh)
+
+
+def _remove_overlays_for_filled_slot(slide, slot_shape) -> None:
+    """When a slot is filled, remove small non-text overlay/frame shapes overlapping it."""
+    slot_r = _rect(slot_shape)
+    slot_a = _area(slot_r)
+    if slot_a <= 0:
+        return
+    to_remove = []
+    for sh in list(slide.shapes):
+        if sh is slot_shape:
+            continue
+        if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
+            continue
+        try:
+            if sh.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                continue
+        except Exception:
+            pass
+        r = _rect(sh)
+        a = _area(r)
+        if a <= 0:
+            continue
+        if a > slot_a * 6.0:
+            continue
+        inter = _intersection(slot_r, r)
+        if inter <= 0:
+            continue
+        if (inter / slot_a) >= 0.10 or (inter / float(min(slot_a, a))) >= 0.25:
+            to_remove.append(sh)
+    for sh in to_remove:
+        _remove_shape(slide, sh)
+
+# ----------------------------
+# Slot ordering + legend pairing
+# ----------------------------
+
+def _center_distance(shape, slide_w: int, slide_h: int) -> float:
+    cx = slide_w / 2.0
+    cy = slide_h / 2.0
+    x = float(getattr(shape, 'left', 0)) + float(getattr(shape, 'width', 0)) / 2.0
+    y = float(getattr(shape, 'top', 0)) + float(getattr(shape, 'height', 0)) / 2.0
+    return abs(cx - x) + abs(cy - y)
+
+
+def _picture_slots(slide, slide_w: int, slide_h: int) -> List[Any]:
     pics = []
     for sh in slide.shapes:
         try:
@@ -340,76 +482,219 @@ def pick_picture_slots(slide) -> List[Any]:
                 pics.append(sh)
         except Exception:
             continue
-    pics.sort(key=lambda sh: (int(getattr(sh, 'top', 0)), int(getattr(sh, 'left', 0))))
+    pics.sort(key=lambda sh: _center_distance(sh, slide_w, slide_h))
     return pics
 
 
-def replace_picture_image(slide, pic_shape, img_file: Path) -> Optional[Any]:
-    """Replace the image embedded in an existing picture shape, preserving its style."""
+def _is_legend_text(t: str) -> bool:
+    if not t:
+        return False
+    nt = re.sub(r"\s+", " ", t.strip()).lower()
+    return ('légende photo' in nt) or ('legende photo' in nt) or ('caption photo' in nt)
+
+
+def _legend_shapes(slide, slide_w: int, slide_h: int) -> List[Any]:
+    leg = []
+    for sh in iter_shapes(slide):
+        try:
+            if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
+                if _is_legend_text(sh.text_frame.text or ''):
+                    leg.append(sh)
+        except Exception:
+            continue
+    leg.sort(key=lambda sh: _center_distance(sh, slide_w, slide_h))
+    return leg
+
+
+def _shape_center(sh) -> Tuple[float, float]:
+    r = _rect(sh)
+    return _center(r)
+
+
+def pair_legends_to_slots(slots: List[Any], legends: List[Any]) -> Dict[int, Any]:
+    if not slots or not legends:
+        return {}
+    unused = set(range(len(legends)))
+    map_idx: Dict[int, Any] = {}
+    for si, s in enumerate(slots):
+        sc = _shape_center(s)
+        best_j = None
+        best_d = None
+        for j in list(unused):
+            lc = _shape_center(legends[j])
+            d = abs(sc[0] - lc[0]) + abs(sc[1] - lc[1])
+            if best_d is None or d < best_d:
+                best_d = d
+                best_j = j
+        if best_j is not None:
+            unused.remove(best_j)
+            map_idx[si] = legends[best_j]
+    return map_idx
+
+# ----------------------------
+# Replace picture embed in-place
+# ----------------------------
+
+def replace_picture_image(slide, pic_shape, img_file: Path) -> bool:
     try:
-        image_part, rId = slide.part.get_or_add_image_part(str(img_file))
+        _image_part, rId = slide.part.get_or_add_image_part(str(img_file))
     except Exception:
-        return None
+        return False
     try:
         blip = pic_shape._element.blipFill.blip
         blip.set(qn('r:embed'), rId)
-        return pic_shape
+        return True
     except Exception:
-        # fallback: try different path to blip
         try:
             blip = pic_shape._element.xpath('.//a:blip')[0]
             blip.set(qn('r:embed'), rId)
-            return pic_shape
+            return True
         except Exception:
-            return None
+            return False
 
+# ----------------------------
+# Legends + images fill/prune
+# ----------------------------
 
-def fill_images_using_picture_shapes(slide, images: List[Any], base_dir: Path, repo_root: Path, tmp_dir: Path, stats: Dict[str, Any]) -> None:
+def fill_legends(slide, slots: List[Any], images: List[Any], slide_w: int, slide_h: int) -> None:
     pairs = images_to_pairs(images)
-    if not pairs:
+    leg = _legend_shapes(slide, slide_w, slide_h)
+    if not leg:
         return
-    slots = pick_picture_slots(slide)
-    print(f"Image slots: pictures={len(slots)} images={len(pairs)}")
+
+    # Associer chaque slot image à la légende la plus proche (stable quel que soit le layout)
+    pairing = pair_legends_to_slots(slots, leg)
+    used_legends = set(id(v) for v in pairing.values())
+
+    WHITE = RGBColor(255, 255, 255)
+    LEGEND_FONT_PT = 11  # optionnel (mets 10 si tu veux compacter)
+
+    for i in range(min(len(pairs), len(slots))):
+        cap = (pairs[i][1] or '').strip()
+        if len(cap) > 120:
+            cap = cap[:117].rstrip() + '…'
+
+        sh = pairing.get(i)
+        if sh is None:
+            continue
+
+        try:
+            tf = sh.text_frame
+            tf.text = cap
+
+            # 1) Coller au BAS du cadre (important)
+            # -> la dernière ligne reste sur le bas, et le texte "remonte" si plusieurs lignes
+            try:
+                tf.vertical_anchor = MSO_VERTICAL_ANCHOR.BOTTOM
+            except Exception:
+                pass
+
+            # 2) Garder dans le cadre : auto-fit + wrap
+            # -> si trop long, police se réduit plutôt que dépasser
+            try:
+                tf.word_wrap = True
+                tf.auto_size = MSO_AUTO_SIZE.TEXT_TO_FIT_SHAPE
+            except Exception:
+                pass
+
+            # 3) Marges minimales (évite le débordement bas)
+            try:
+                tf.margin_top = 0
+                tf.margin_bottom = 0
+                tf.margin_left = 0
+                tf.margin_right = 0
+            except Exception:
+                pass
+
+            # 4) Forcer le BLANC (python-pptx perd le style template quand on fait tf.text = ...)
+            try:
+                for p in tf.paragraphs:
+                    p.alignment = PP_ALIGN.LEFT
+                    # style au niveau paragraphe
+                    try:
+                        p.font.color.rgb = WHITE
+                        p.font.size = Pt(LEGEND_FONT_PT)
+                    except Exception:
+                        pass
+                    # style au niveau runs (plus robuste)
+                    for run in p.runs:
+                        try:
+                            run.font.color.rgb = WHITE
+                            run.font.size = Pt(LEGEND_FONT_PT)
+                        except Exception:
+                            pass
+            except Exception:
+                pass
+
+        except Exception:
+            pass
+
+    # Nettoyer les placeholders non utilisés (sans casser la mise en page)
+    for sh in leg:
+        if id(sh) in used_legends:
+            continue
+        try:
+            if _is_legend_text(sh.text_frame.text or ''):
+                sh.text_frame.text = ''
+        except Exception:
+            pass
+
+
+
+def fill_images_and_cleanup(slide, images: List[Any], base_dir: Path, repo_root: Path, tmp_dir: Path, stats: Dict[str, Any], slide_w: int, slide_h: int) -> List[Any]:
+    pairs = images_to_pairs(images)
+    slots = _picture_slots(slide, slide_w, slide_h)
+    k = len(pairs)
     if not slots:
-        return
-    count = min(len(pairs), len(slots))
-    for i in range(count):
+        print(f"Image slots: pictures=0 images={k}")
+        return []
+    if k == 0:
+        for sh in list(slots):
+            _remove_slot_cluster(slide, sh)
+        print("Image slots: pictures=0 images=0 (pruned all)")
+        return []
+    if k < len(slots):
+        for sh in list(slots[k:]):
+            _remove_slot_cluster(slide, sh)
+        slots = slots[:k]
+        print(f"Image slots: pictures={len(slots)} images={k} (kept center={len(slots)})")
+    kept: List[Any] = []
+    for i in range(min(k, len(slots))):
         path, _cap = pairs[i]
         stats['requested'] += 1
         ip = resolve_image_path(path, base_dir, repo_root)
         if not ip:
             stats['unresolved'].append(path)
+            _remove_slot_cluster(slide, slots[i])
             continue
         normp = normalize_image_for_ppt(ip, tmp_dir)
         if not normp:
             stats['unresolved'].append(path)
+            _remove_slot_cluster(slide, slots[i])
             continue
-        pic = replace_picture_image(slide, slots[i], normp)
-        if pic is None:
+        ok = replace_picture_image(slide, slots[i], normp)
+        if not ok:
             stats['unresolved'].append(path)
+            _remove_slot_cluster(slide, slots[i])
             continue
-        _crop_to_fill(pic, normp, int(getattr(pic, 'width', 0)), int(getattr(pic, 'height', 0)))
-        stats['embedded'] += 1
-
-
-def fill_legends_in_place(slide, images: List[Any]) -> None:
-    pairs = images_to_pairs(images)
-    legends = []
-    for sh in slide.shapes:
-        if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
-            if 'Légende Photo' in (sh.text_frame.text or ''):
-                legends.append(sh)
-    for idx, sh in enumerate(legends):
-        cap = ''
-        if idx < len(pairs):
-            cap = (pairs[idx][1] or '').strip()
-            if len(cap) > 80:
-                cap = cap[:77].rstrip() + '…'
+        _crop_to_fill(slots[i], normp, int(getattr(slots[i], 'width', 0)), int(getattr(slots[i], 'height', 0)))
         try:
-            sh.text_frame.text = cap
+            slots[i].line.width = 0
+            slots[i].line.fill.background()
         except Exception:
             pass
+        try:
+            slots[i].shadow.visible = False
+        except Exception:
+            pass
+        _remove_overlays_for_filled_slot(slide, slots[i])
+        stats['embedded'] += 1
+        kept.append(slots[i])
+    return kept
 
+# ----------------------------
+# Save helper
+# ----------------------------
 
 def safe_save(prs: Presentation, out_path: Path) -> Path:
     out_path.parent.mkdir(parents=True, exist_ok=True)
@@ -423,6 +708,9 @@ def safe_save(prs: Presentation, out_path: Path) -> Path:
         print(f"WARNING: target PPTX locked, wrote instead: {alt}")
         return alt
 
+# ----------------------------
+# Build deck
+# ----------------------------
 
 def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_types_path: Path, repo_root_override: Optional[Path] = None) -> None:
     base_tpl = Presentation(str(base_template))
@@ -431,28 +719,23 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
     base_dir = assembled_path.parent
     tmp_dir = base_dir / '_tmp_img'
     tmp_dir.mkdir(parents=True, exist_ok=True)
-
     stats = {'requested': 0, 'embedded': 0, 'unresolved': []}
     cfg = load_json(slide_types_path) if slide_types_path.exists() else {'types': {}, 'defaults': {}}
     catalog = detect_template_slide_types(base_tpl, cfg)
-
     prs_out = Presentation()
     prs_out.slide_width = base_tpl.slide_width
     prs_out.slide_height = base_tpl.slide_height
-
     today = datetime.now().strftime('%d/%m/%Y')
     global_map = {
         '{{DATE}}': today,
         '{{VERSION}}': '1',
         '{{CONTACT_EMAIL}}': 'contact@build4use.eu',
     }
-
     def emit_content_slide(s: Dict[str, Any]):
         stype = (s.get('type') or 'CONTENT_TEXT').strip()
         title = (s.get('title') or '').strip()
         body = (s.get('bullets') or s.get('body') or '')
         imgs = s.get('images') or []
-
         slide_in = catalog.get(stype) or catalog.get('CONTENT_TEXT_IMAGES') or catalog.get('CONTENT_TEXT')
         if not slide_in:
             return
@@ -460,15 +743,14 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
         replace_placeholders(slide_out, global_map)
         _set_title_any(slide_out, title)
         _set_body_any(slide_out, body, max_lines=12 if imgs else 14)
-        fill_legends_in_place(slide_out, imgs)
-        fill_images_using_picture_shapes(slide_out, imgs, base_dir, repo_root, tmp_dir, stats)
-
+        sw, sh = int(prs_out.slide_width), int(prs_out.slide_height)
+        kept_slots = fill_images_and_cleanup(slide_out, imgs, base_dir, repo_root, tmp_dir, stats, sw, sh)
+        fill_legends(slide_out, kept_slots, imgs, sw, sh)
     slides_spec = data.get('slides')
     if isinstance(slides_spec, list):
         for s in slides_spec:
             if isinstance(s, dict) and s.get('type') != 'PART_DIVIDER':
                 emit_content_slide(s)
-
     final_path = safe_save(prs_out, out_path)
     print(f"Repo root: {repo_root}")
     print(f"Images: embedded {stats['embedded']} / requested {stats['requested']}")
