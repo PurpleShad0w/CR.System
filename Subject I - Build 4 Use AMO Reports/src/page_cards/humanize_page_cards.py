@@ -26,10 +26,6 @@ if str(SRC) not in sys.path:
 from llm_client import make_client
 
 
-# -----------------------------
-# IO
-# -----------------------------
-
 def load_json(p: Path) -> Any:
     try:
         return json.loads(p.read_text(encoding='utf-8'))
@@ -51,10 +47,6 @@ def load_style_card(repo_root: Path) -> str:
     except Exception:
         return ''
 
-
-# -----------------------------
-# Normalization & dedup
-# -----------------------------
 
 def normalize_whitespace(text: str) -> str:
     t = (text or '').replace('\r\n', '\n').replace('\r', '\n')
@@ -102,10 +94,7 @@ def dedup_lines(lines: List[str], *, thresh: float = 0.82, max_keep: int = 8) ->
     return out
 
 
-# -----------------------------
-# Deterministic title normalization (Option A)
-# -----------------------------
-
+# Option A: deterministic title normalization
 TITLE_MAP_EXACT = {
     'ge': 'Groupe électrogène',
     'groupes froids': 'Groupes froids',
@@ -120,59 +109,37 @@ TITLE_MAP_EXACT = {
 
 
 def normalize_title(raw: str) -> str:
-    """Make titles look like report headings, without LLM.
-    - Expand common acronyms
-    - Standardize CTA/TD/RDC/R+X
-    - Fix casing
-    """
     s = (raw or '').strip()
     if not s:
         return ''
-
-    # Remove trailing ??? and excessive punctuation
     s = re.sub(r"\?{2,}", "", s).strip()
     s = re.sub(r"\s{2,}", " ", s).strip()
-
     low = _norm(s)
     if low in TITLE_MAP_EXACT:
         return TITLE_MAP_EXACT[low]
-
-    # Common patterns
-    # CTA numbers
     m = re.match(r"^(cta)\s*([0-9]+)\s*(.*)$", s, flags=re.IGNORECASE)
     if m:
         num = m.group(2)
         tail = (m.group(3) or '').strip()
         head = f"CTA {num}"
         if tail:
-            # normalize separators
             tail = tail.replace(' - ', ' – ').replace('-', ' – ')
             return f"{head} – {tail}" if '–' not in tail else f"{head} {tail}"
         return head
-
-    # TD patterns
     m = re.match(r"^(td)\s*(.*)$", s, flags=re.IGNORECASE)
     if m:
         tail = (m.group(2) or '').strip()
-        # common floors
         tail = re.sub(r"\brdc\b", "RDC", tail, flags=re.IGNORECASE)
         tail = re.sub(r"\bsous\s*sol\b", "Sous-sol", tail, flags=re.IGNORECASE)
         tail = re.sub(r"\bniveau\b", "Niveau", tail, flags=re.IGNORECASE)
         if tail:
             return f"Tableau divisionnaire – {tail}"
         return "Tableau divisionnaire"
-
-    # Abbrev like Cta4 -> CTA 4
     m = re.match(r"^(cta)([0-9]+)$", s, flags=re.IGNORECASE)
     if m:
         return f"CTA {m.group(2)}"
-
-    # Simple tokens
     if len(s) <= 4:
-        # keep uppercase
         return s.upper()
-
-    # Title case with exceptions
     words = s.split(' ')
     out = []
     for w in words:
@@ -185,10 +152,6 @@ def normalize_title(raw: str) -> str:
             out.append(w[:1].upper() + w[1:])
     return ' '.join(out).strip()
 
-
-# -----------------------------
-# STRICT bullet extraction (prevents "voici les puces..." etc.)
-# -----------------------------
 
 LLM_META_PREFIXES = (
     'voici les puces',
@@ -205,26 +168,16 @@ LLM_META_PREFIXES = (
 
 
 def extract_title_and_bullets(model_text: str) -> Tuple[Optional[str], str]:
-    """Expected output:
-    Titre: ...
-    - ...
-    - ...
-    Everything else is ignored.
-    """
     if not model_text:
         return None, ''
-
     lines = [ln.strip() for ln in normalize_whitespace(model_text).split('\n') if ln.strip()]
     title_out: Optional[str] = None
     bullets: List[str] = []
-
     for ln in lines:
         low = ln.lower()
         if low.startswith('titre:') or low.startswith('title:'):
-            title_out = ln.split(':', 1)[1].strip()
-            title_out = normalize_title(title_out)
+            title_out = normalize_title(ln.split(':', 1)[1].strip())
             continue
-
         if ln.startswith('- '):
             payload = ln[2:].strip()
             if payload:
@@ -235,49 +188,38 @@ def extract_title_and_bullets(model_text: str) -> Tuple[Optional[str], str]:
             if payload:
                 bullets.append('- ' + payload)
             continue
-
         if any(pfx in low for pfx in LLM_META_PREFIXES):
             continue
-
     cleaned: List[str] = []
     for b in bullets:
         s = b[2:].strip()
         if not s:
             continue
-        # forbid rigid "Field: ..." patterns (avoid incoherence)
         if re.match(r"^[A-Za-zÀ-ÿ '\-]+\s*:\s+", s):
             continue
         if len(s) > 170:
             s = s[:169].rstrip() + '…'
         cleaned.append('- ' + s)
-
-    # Remove "Rien à signaler" if there is other content
     if len(cleaned) >= 2:
         cleaned = [b for b in cleaned if 'rien a signaler' not in _norm(b)]
-
     cleaned = dedup_lines(cleaned, thresh=0.82, max_keep=6)
     return title_out, '\n'.join(cleaned)
 
 
 def fallback_bullets_from_notes(raw_notes: str) -> str:
-    """If little/no text, do NOT invent. Return "Rien à signaler"."""
     n = _norm(raw_notes or '')
     if len(n) < 25:
         return '- Rien à signaler (notes insuffisantes).'
-
     items: List[str] = []
     for ln in normalize_whitespace(raw_notes).split('\n'):
         s = ln.strip()
         if not s:
             continue
-        # filter template leftovers
         if 'Texte Détail' in s or 'Info Clé' in s or 'User flow' in s or s.strip().lower() == 'page':
             continue
         items.append(s)
-
     if not items:
         return '- Rien à signaler (notes insuffisantes).'
-
     out = []
     for it in items[:4]:
         it = it.strip()
@@ -287,10 +229,6 @@ def fallback_bullets_from_notes(raw_notes: str) -> str:
     out = dedup_lines(out, thresh=0.82, max_keep=4)
     return '\n'.join(out)
 
-
-# -----------------------------
-# LLM helpers
-# -----------------------------
 
 def build_messages(prompt: str, *, style_card: str = '') -> List[Dict[str, str]]:
     sys_msg = "Tu es un rédacteur technique Build 4 Use. Style professionnel, neutre et factuel."
@@ -324,11 +262,9 @@ def safe_chat(client, messages, *, temperature: float, max_tokens: int, top_p: f
 
 
 def prompt_slide_etat_des_lieux(*, section_name: str, title: str, raw_notes: str) -> str:
-    """Strict format. No fixed headings (Supervision/Historisation/etc.)."""
     raw_notes = (raw_notes or '').strip()
     section_name = (section_name or '').strip()
     title = (title or '').strip()
-
     return (
         "Tu rédiges une diapositive d'état des lieux GTB à partir de notes brutes.\n"
         "Objectif: décrire l'existant de manière factuelle et sobre, sans sur-interprétation.\n\n"
@@ -350,44 +286,53 @@ def prompt_slide_etat_des_lieux(*, section_name: str, title: str, raw_notes: str
     )
 
 
+def ensure_image_captions(slide: Dict[str, Any], fallback: str) -> None:
+    """Ensure image captions are non-empty so legends can be rendered.
+    If caption is missing/empty, set it to fallback.
+    """
+    imgs = slide.get('images')
+    if not isinstance(imgs, list) or not fallback:
+        return
+    for im in imgs:
+        if isinstance(im, dict):
+            cap = (im.get('caption') or '').strip()
+            if not cap:
+                im['caption'] = fallback
+
+
 def humanize_assembled(assembled: Dict[str, Any], *, enabled: bool, style_card: str,
     temperature: float, max_tokens: int, top_p: float, sleep_s: float) -> Dict[str, Any]:
     if not enabled:
         return assembled
-
     section_name = ((assembled.get('section_context') or {}).get('onenote_section_name') or '').strip()
     slides = assembled.get('slides') or []
     if not isinstance(slides, list):
         return assembled
-
     client = make_client()
-
     for s in slides:
         if not isinstance(s, dict):
             continue
         if (s.get('type') or '').strip() == 'PART_DIVIDER':
             continue
-
         title_raw = (s.get('title') or '').strip()
         s['raw_title'] = title_raw
         s['title'] = normalize_title(title_raw)
-
+        # ensure captions exist even if we don't call LLM
+        ensure_image_captions(s, s['title'] or title_raw)
         raw_notes = (s.get('bullets') or s.get('body') or '').strip()
-
-        # If little/no text, do NOT call LLM, output "Rien à signaler".
         if len(_norm(raw_notes)) < 25:
             s['raw_bullets'] = raw_notes
             s['bullets'] = '- Rien à signaler (notes insuffisantes).'
             continue
-
         prompt = prompt_slide_etat_des_lieux(section_name=section_name, title=title_raw, raw_notes=raw_notes)
         msg = build_messages(prompt, style_card=style_card)
         out, err = safe_chat(client, msg, temperature=temperature, max_tokens=max_tokens, top_p=top_p)
-
         if out:
             t_new, b_new = extract_title_and_bullets(out)
             if t_new:
                 s['title'] = t_new
+            # update captions with final title
+            ensure_image_captions(s, s['title'] or title_raw)
             if b_new:
                 s['raw_bullets'] = raw_notes
                 s['bullets'] = b_new
@@ -399,10 +344,8 @@ def humanize_assembled(assembled: Dict[str, Any], *, enabled: bool, style_card: 
             s['llm_error'] = err or 'unknown'
             s['raw_bullets'] = raw_notes
             s['bullets'] = fallback_bullets_from_notes(raw_notes)
-
         if sleep_s and sleep_s > 0:
             time.sleep(float(sleep_s))
-
     assembled['slides'] = slides
     return assembled
 
@@ -419,13 +362,10 @@ def main() -> None:
     ap.add_argument('--top-p', type=float, default=1.0)
     ap.add_argument('--sleep', type=float, default=0.0)
     args = ap.parse_args()
-
     inp = Path(args.assembled)
     outp = Path(args.out) if args.out else inp
-
     assembled = load_json(inp)
     style_card = load_style_card(REPO_ROOT)
-
     assembled = humanize_assembled(
         assembled,
         enabled=bool(args.humanize),
@@ -435,7 +375,6 @@ def main() -> None:
         top_p=float(args.top_p),
         sleep_s=float(args.sleep),
     )
-
     save_json(outp, assembled)
     print('Wrote:', outp)
 

@@ -2,19 +2,16 @@
 # -*- coding: utf-8 -*-
 """render_report_pptx.py (Templates Slides focus)
 
-Renderer for Page Cards / assembled JSON -> PPTX.
+Additional fixes requested after comparing latest output:
+- Remove the remaining empty black blocks (typically overlay/gradient companions of removed picture/legend slots).
+- Ensure legends are present on most slides by using a fallback caption when the caption is missing.
 
-Fixes/alignments vs the human reference deck and latest generated output:
-- Remove template artifacts: "Info Clé", "Texte Détail", "User flow", and empty "Page" labels.
-- Ensure the fixed header reads "Etat des lieux GTB" (instead of "Etat des lieux").
-- Enforce typography:
-  * Body: Aptos 15pt black
-  * Orange header (slide title): Verdana 32pt #FF5C19
-  * Legends: Aptos 12pt white, centered, bottom anchored with a small margin
-- Add the "Build 4 Use" logo bottom-left by extracting it from the template deck.
+We do this by:
+1) Removing *clusters* (slot picture + overlapping non-text shapes) when an image slot is unused or unresolved.
+2) Filling legend text for each kept image; if caption is empty, we use the slide title as fallback.
+3) Removing unused legend clusters (text + overlay) instead of leaving empty dark boxes.
 
-CLI (unchanged):
-  python render_report_pptx.py --template <pptx> --assembled <json> --out <pptx> --slide-types <json>
+Other existing behavior remains (fonts, logo, template artifact cleanup, etc.).
 """
 
 from __future__ import annotations
@@ -30,6 +27,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 from pptx import Presentation
 from pptx.dml.color import RGBColor
+from pptx.enum.dml import MSO_THEME_COLOR
 from pptx.enum.shapes import MSO_SHAPE_TYPE
 from pptx.enum.text import PP_ALIGN, MSO_AUTO_SIZE, MSO_VERTICAL_ANCHOR
 from pptx.oxml.ns import qn
@@ -131,13 +129,70 @@ def _remove_shape(slide, shape) -> None:
         pass
 
 
+# ----------------------------
+# Geometry helpers for cluster deletion
+# ----------------------------
+
+def _rect(sh) -> Tuple[int, int, int, int]:
+    return (int(getattr(sh, 'left', 0)), int(getattr(sh, 'top', 0)), int(getattr(sh, 'width', 0)), int(getattr(sh, 'height', 0)))
+
+
+def _area(r: Tuple[int, int, int, int]) -> int:
+    return max(0, r[2]) * max(0, r[3])
+
+
+def _intersection(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> int:
+    ax, ay, aw, ah = a
+    bx, by, bw, bh = b
+    ax2, ay2 = ax + aw, ay + ah
+    bx2, by2 = bx + bw, by + bh
+    ix1, iy1 = max(ax, bx), max(ay, by)
+    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+    if ix2 <= ix1 or iy2 <= iy1:
+        return 0
+    return (ix2 - ix1) * (iy2 - iy1)
+
+
+def _remove_cluster(slide, anchor_shape, *, keep_pictures: bool = True) -> None:
+    """Remove anchor_shape and nearby overlapping companion shapes.
+    Used to remove empty black blocks (gradients/frames) tied to removed slots.
+    """
+    ar = _rect(anchor_shape)
+    aa = _area(ar)
+    # remove anchor itself
+    _remove_shape(slide, anchor_shape)
+    if aa <= 0:
+        return
+    comp = []
+    for sh in list(slide.shapes):
+        if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
+            continue
+        try:
+            if keep_pictures and sh.shape_type == MSO_SHAPE_TYPE.PICTURE:
+                continue
+        except Exception:
+            pass
+        r = _rect(sh)
+        a = _area(r)
+        if a <= 0:
+            continue
+        # don't nuke slide backgrounds
+        if a > aa * 10.0:
+            continue
+        inter = _intersection(ar, r)
+        if inter <= 0:
+            continue
+        if (inter / aa) >= 0.08 or (inter / float(min(aa, a))) >= 0.20:
+            comp.append(sh)
+    for sh in comp:
+        _remove_shape(slide, sh)
+
+
 def remove_template_artifacts(slide) -> None:
-    """Remove known template placeholders that should not appear in deliverables."""
     for sh in list(slide.shapes):
         if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
             txt = (sh.text_frame.text or '').strip()
             low = txt.lower()
-            # Remove unused block and scaffolding words
             if (
                 'info clé' in low or 'info cle' in low
                 or 'texte détail' in low or 'texte detail' in low
@@ -146,18 +201,63 @@ def remove_template_artifacts(slide) -> None:
             ):
                 _remove_shape(slide, sh)
                 continue
-            # If the shape is exactly the empty label "Page" (or "Page ") then remove
             if re.fullmatch(r"page\s*", txt, flags=re.IGNORECASE):
                 _remove_shape(slide, sh)
 
 
+def remove_infos_clefs_block(slide):
+    """
+    Remove the black rounded rectangle used for 'Infos clefs'
+    that is always present at the same position in the template.
+    """
+    for sh in list(slide.shapes):
+        # only non-text shapes
+        if getattr(sh, 'has_text_frame', False):
+            continue
+
+        # must have a fill
+        try:
+            fill = sh.fill
+            if not fill or not fill.fore_color:
+                continue
+        except Exception:
+            continue
+
+        # solid black fill
+        try:
+            rgb = fill.fore_color.rgb
+        except Exception:
+            continue
+
+        if rgb != RGBColor(0, 0, 0):
+            continue
+
+        # geometry filter: left-side rounded rectangle
+        try:
+            left = int(sh.left)
+            top = int(sh.top)
+            width = int(sh.width)
+            height = int(sh.height)
+        except Exception:
+            continue
+
+        # heuristics based on template layout
+        if (
+            left < int(slide.part.presentation.slide_width * 0.35)
+            and height < int(slide.part.presentation.slide_height * 0.25)
+            and width > int(slide.part.presentation.slide_width * 0.15)
+        ):
+            # this is the Infos clefs black block
+            try:
+                slide.shapes._spTree.remove(sh._element)
+            except Exception:
+                pass
+
+
 def enforce_etat_des_lieux_gtb(slide) -> None:
-    """Replace 'Etat des lieux' with 'Etat des lieux GTB' when it looks like the fixed header."""
     for sh in list(slide.shapes):
         if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
-            txt = (sh.text_frame.text or '')
-            # exact token in template snippets
-            if txt.strip() == 'Etat des lieux':
+            if (sh.text_frame.text or '').strip() == 'Etat des lieux':
                 sh.text_frame.text = 'Etat des lieux GTB'
 
 
@@ -491,26 +591,32 @@ def fill_images(slide_out, imgs: List[Any], base_dir: Path, repo_root: Path, tmp
     pairs = images_to_pairs(imgs)
     slots = picture_slots(slide_out, slide_w, slide_h)
     k = min(len(pairs), len(slots))
+    # remove unused slots as clusters (prevents empty black blocks)
     for sh in list(slots[k:]):
-        _remove_shape(slide_out, sh)
+        _remove_cluster(slide_out, sh, keep_pictures=True)
     slots = slots[:k]
 
-    kept = []
+    kept: List[Any] = []
     for i in range(k):
         path, _cap = pairs[i]
         ip = resolve_image_path(path, base_dir, repo_root)
         if not ip:
+            # remove slot cluster if we can't fill it
+            _remove_cluster(slide_out, slots[i], keep_pictures=True)
             continue
         normp = normalize_image_for_ppt(ip, tmp_dir)
         if not normp:
+            _remove_cluster(slide_out, slots[i], keep_pictures=True)
             continue
         if replace_picture_image(slide_out, slots[i], normp):
             crop_to_fill(slots[i], normp, int(getattr(slots[i], 'width', 0)), int(getattr(slots[i], 'height', 0)))
             kept.append(slots[i])
+        else:
+            _remove_cluster(slide_out, slots[i], keep_pictures=True)
     return kept
 
 
-def fill_legends(slide_out, kept_slots: List[Any], imgs: List[Any], slide_w: int, slide_h: int) -> None:
+def fill_legends(slide_out, kept_slots: List[Any], imgs: List[Any], slide_w: int, slide_h: int, *, fallback_title: str = '') -> None:
     pairs = images_to_pairs(imgs)
     legs = legend_shapes(slide_out, slide_w, slide_h)
     if not legs:
@@ -520,6 +626,14 @@ def fill_legends(slide_out, kept_slots: List[Any], imgs: List[Any], slide_w: int
 
     for i in range(min(len(pairs), len(kept_slots))):
         cap = (pairs[i][1] or '').strip()
+        if not cap:
+            cap = (fallback_title or '').strip()
+        if not cap:
+            # no caption -> remove legend cluster to avoid empty black block
+            sh = pairing.get(i)
+            if sh is not None:
+                _remove_cluster(slide_out, sh, keep_pictures=True)
+            continue
         if len(cap) > 90:
             cap = cap[:87].rstrip() + '…'
         sh = pairing.get(i)
@@ -542,12 +656,14 @@ def fill_legends(slide_out, kept_slots: List[Any], imgs: List[Any], slide_w: int
             pass
         style_text_frame(tf, font_name=FONT_BODY, font_size_pt=PT_LEGEND, color=WHITE, align=PP_ALIGN.CENTER)
 
-    for sh in legs:
+    # remove unused legend placeholders as clusters (prevents empty black blocks)
+    for sh in list(legs):
         if id(sh) in used:
             continue
         try:
-            if is_legend_placeholder(sh.text_frame.text or ''):
-                sh.text_frame.text = ''
+            # only remove if it still looks like placeholder (or already empty)
+            if is_legend_placeholder(sh.text_frame.text or '') or not (sh.text_frame.text or '').strip():
+                _remove_cluster(slide_out, sh, keep_pictures=True)
         except Exception:
             pass
 
@@ -615,6 +731,7 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
 
         remove_template_artifacts(slide_out)
         enforce_etat_des_lieux_gtb(slide_out)
+        remove_infos_clefs_block(slide_out)
         ensure_logo(slide_out, logo_path, logo_geom)
 
         set_slide_title(slide_out, title)
@@ -622,7 +739,7 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
 
         sw, sh = int(prs_out.slide_width), int(prs_out.slide_height)
         kept = fill_images(slide_out, imgs, base_dir, repo_root, tmp_dir, sw, sh)
-        fill_legends(slide_out, kept, imgs, sw, sh)
+        fill_legends(slide_out, kept, imgs, sw, sh, fallback_title=title)
 
     slides_spec = data.get('slides')
     if isinstance(slides_spec, list):
