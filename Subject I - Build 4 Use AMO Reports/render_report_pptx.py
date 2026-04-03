@@ -2,28 +2,21 @@
 # -*- coding: utf-8 -*-
 """render_report_pptx.py (Templates Slides focus)
 
-FIX (gradients for unused photo slots) WITHOUT breaking image placement.
+Objectif (nouvelle règle demandée) :
+- Vous allez créer dans "Templates Slides.pptx" des variantes de slide avec 6,5,4,3,2,1,0 images.
+- Le renderer doit choisir AUTOMATIQUEMENT la variante qui correspond exactement au nombre d'images disponibles.
+- On conserve le placement habituel (remplacement des placeholders PICTURE), et on ne casse plus la sélection.
 
-Key idea (matches your observation in the template):
-- The template deck contains at least two valid layouts:
-  * a 6-photo layout (slide_1)
-  * a 4-photo layout (slide_2)
-- In the 4-photo layout, the "missing 2" slots simply do not exist (no gradient).
+Principe d'implémentation :
+1) On détecte les slides "variants" dans la template via slide_types_template_slides.json (tokens visibles).
+2) Pour chaque slide variante, on calcule le nombre de "photo slots" = nombre de shapes PICTURE situées dans la zone photo (partie droite).
+3) Au rendu d'une slide, si nb_images = N, on choisit la variante ayant slot_count == N si elle existe.
+   - sinon fallback : plus petite variante >= N, sinon la plus grande.
+4) On remplit les N slots PICTURE par remplacement d'image, crop-to-fill.
+5) Si la variante choisie contient plus de slots que N (cas fallback), on supprime les slots non utilisés + compagnons superposés.
 
-So we emulate the template:
-1) Choose the template slide variant based on how many images we need to place:
-   - if nb_images <= 4 and a 4-slot variant exists -> use it
-   - else -> use the 6-slot variant
-2) Place images using the existing PICTURE placeholders (stable; does not change selection).
-3) If the chosen variant still has more slots than nb_images (e.g., 6-slot but only 5 images),
-   remove the UNUSED SLOT companions (gradients/frames) by deleting any non-text shapes
-   that overlap that unused placeholder area.
-4) IMPORTANT: when a slot is filled, keep the template shadow.
-
-Other behaviors kept:
-- Remove template artifacts (Info Clé, Texte Détail, User flow, empty Page labels)
-- Ensure header reads "Etat des lieux GTB"
-- Typography + legends + logo kept as in your current renderer.
+Note importante :
+- On NE désactive PAS l'ombre sur les slots remplis.
 
 CLI:
   python render_report_pptx.py --template <pptx> --assembled <json> --out <pptx> --slide-types <json>
@@ -170,7 +163,7 @@ def enforce_etat_des_lieux_gtb(slide) -> None:
 
 
 # ----------------------------
-# Geometry helpers (unused slot companion removal)
+# Geometry helpers (for unused slot cleanup in fallback cases)
 # ----------------------------
 
 def _rect(sh) -> Tuple[int, int, int, int]:
@@ -194,13 +187,7 @@ def _intersection(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) ->
 
 
 def _remove_unused_slot_companions(slide, slot_shape) -> None:
-    """Remove gradient/frame companions for an UNUSED slot.
-
-    We keep this simple and safe:
-    - remove non-text shapes (including gradient pictures) that overlap the UNUSED slot area.
-    - do not touch text shapes.
-    - do not touch filled slots (this function only called for unused ones).
-    """
+    """Remove companions (gradients/frames) that overlap an UNUSED slot."""
     sr = _rect(slot_shape)
     sa = _area(sr)
     if sa <= 0:
@@ -209,6 +196,7 @@ def _remove_unused_slot_companions(slide, slot_shape) -> None:
     for sh in list(slide.shapes):
         if sh is slot_shape:
             continue
+        # never remove text boxes
         if getattr(sh, 'has_text_frame', False) and sh.has_text_frame:
             continue
         r = _rect(sh)
@@ -221,7 +209,7 @@ def _remove_unused_slot_companions(slide, slot_shape) -> None:
         inter = _intersection(sr, r)
         if inter <= 0:
             continue
-        # require decent overlap
+        # require overlap
         if (inter / sa) < 0.06 and (inter / float(min(sa, a))) < 0.18:
             continue
         to_remove.append(sh)
@@ -332,7 +320,7 @@ def images_to_pairs(images: List[Any]) -> List[Tuple[str, str]]:
 # ----------------------------
 
 def slot_pictures(slide, slide_w: int, slide_h: int) -> List[Any]:
-    """Return picture placeholders that correspond to photo slots (right-side grid)."""
+    """Return PICTURE placeholders that correspond to photo slots (right-side grid)."""
     pics: List[Any] = []
     for sh in slide.shapes:
         try:
@@ -344,7 +332,7 @@ def slot_pictures(slide, slide_w: int, slide_h: int) -> List[Any]:
         # right side only
         if l < int(slide_w * 0.45):
             continue
-        # exclude small logos etc.
+        # exclude tiny pictures (logos etc.)
         if w < int(slide_w * 0.08) or h < int(slide_h * 0.08):
             continue
         pics.append(sh)
@@ -352,27 +340,29 @@ def slot_pictures(slide, slide_w: int, slide_h: int) -> List[Any]:
     return pics
 
 
-def count_slot_pictures(slide, slide_w: int, slide_h: int) -> int:
+def slot_count(slide, slide_w: int, slide_h: int) -> int:
     return len(slot_pictures(slide, slide_w, slide_h))
 
 
-def choose_variant(variants: List[Any], nb_images: int, slide_w: int, slide_h: int) -> Any:
-    """Pick the smallest variant that can host nb_images, else the largest."""
-    cands = []
-    for sl in variants:
-        cands.append((count_slot_pictures(sl, slide_w, slide_h), sl))
-    cands.sort(key=lambda x: x[0])
-    for n, sl in cands:
-        if n >= max(1, nb_images):
-            # Prefer 4-slot layout when nb_images<=4
-            if nb_images <= 4 and n == 4:
-                return sl
+def choose_variant_exact(variants: List[Any], nb_images: int, slide_w: int, slide_h: int) -> Any:
+    """Choose the variant whose slot_count matches nb_images exactly if possible.
+    Fallback: smallest variant with >= nb_images, else largest.
+    """
+    annot = [(slot_count(sl, slide_w, slide_h), sl) for sl in variants]
+    annot.sort(key=lambda x: x[0])
+    # exact match
+    for n, sl in annot:
+        if n == nb_images:
             return sl
-    return cands[-1][1]
+    # smallest >=
+    for n, sl in annot:
+        if n >= nb_images:
+            return sl
+    return annot[-1][1]
 
 
 # ----------------------------
-# Picture replace
+# Picture replace + crop
 # ----------------------------
 
 def replace_picture_image(slide, pic_shape, img_file: Path) -> bool:
@@ -555,7 +545,7 @@ def set_body_bullets(slide_out, body: str, *, max_lines: int) -> None:
 
 
 # ----------------------------
-# Legends (unchanged simple mapping)
+# Legends (simple mapping)
 # ----------------------------
 
 def is_legend_placeholder(t: str) -> bool:
@@ -613,7 +603,7 @@ def fill_legends(slide_out, used_slot_count: int, imgs: List[Any], *, fallback_t
 
 
 # ----------------------------
-# Fill images (slot pictures + companion deletion for unused)
+# Fill images using exact variant
 # ----------------------------
 
 def fill_images(slide_out, imgs: List[Any], base_dir: Path, repo_root: Path, tmp_dir: Path, slide_w: int, slide_h: int) -> int:
@@ -621,7 +611,6 @@ def fill_images(slide_out, imgs: List[Any], base_dir: Path, repo_root: Path, tmp
     slots = slot_pictures(slide_out, slide_w, slide_h)
     k = min(len(pairs), len(slots))
 
-    # Fill used slots (keep shadow)
     filled = 0
     for i in range(k):
         path, _cap = pairs[i]
@@ -637,7 +626,7 @@ def fill_images(slide_out, imgs: List[Any], base_dir: Path, repo_root: Path, tmp
         crop_to_fill(slots[i], normp, int(getattr(slots[i], 'width', 0)), int(getattr(slots[i], 'height', 0)))
         filled += 1
 
-    # Remove unused slots (picture placeholder + companions)
+    # fallback safety: if slots exist beyond k, remove them + companions
     for i in range(k, len(slots)):
         _remove_unused_slot_companions(slide_out, slots[i])
         _remove_shape(slide_out, slots[i])
@@ -675,7 +664,7 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
     tmp_dir.mkdir(parents=True, exist_ok=True)
 
     cfg = load_json(slide_types_path) if slide_types_path.exists() else {'types': {}, 'defaults': {}}
-    variants = detect_template_slide_variants(base_tpl, cfg)
+    variants_by_type = detect_template_slide_variants(base_tpl, cfg)
 
     prs_out = Presentation()
     prs_out.slide_width = base_tpl.slide_width
@@ -710,11 +699,12 @@ def build_deck(base_template: Path, assembled_path: Path, out_path: Path, slide_
         imgs = s.get('images') or []
         nb_images = len(images_to_pairs(imgs))
 
-        # Choose best variant (4-slot vs 6-slot) if available
-        cand_list = variants.get(stype) or variants.get('CONTENT_TEXT_IMAGES') or variants.get('CONTENT_TEXT') or []
+        cand_list = variants_by_type.get(stype) or variants_by_type.get('CONTENT_TEXT_IMAGES') or variants_by_type.get('CONTENT_TEXT') or []
         if not cand_list:
             return
-        slide_in = choose_variant(cand_list, nb_images, sw, sh)
+
+        # Choose exact variant by nb_images
+        slide_in = choose_variant_exact(cand_list, nb_images, sw, sh)
 
         slide_out = clone_slide(prs_out, slide_in)
         replace_placeholders(slide_out)
