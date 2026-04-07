@@ -3,6 +3,7 @@
 Autocontroles/
 __pycache__/
 cache/
+db/
 output/
 process/
 reports/
